@@ -700,8 +700,8 @@ function SftpPage({
 }) {
   const [path, setPath] = useState("~");
   const [remoteFiles, setRemoteFiles] = useState<
-    Array<{ name: string; kind: string }>
-  >([]);
+    Array<{ name: string; kind: string }> | undefined
+  >();
   const [transfers, setTransfers] = useState<Transfer[]>([]);
   const fileInput = useRef<HTMLInputElement>(null);
   const fallback = [
@@ -710,20 +710,26 @@ function SftpPage({
     { name: "release.tar.gz", kind: "file" },
     { name: "README.md", kind: "file" },
   ];
+  const refreshDirectory = async () => {
+    if (!session) return;
+    const response = await api.sftpList({ session_id: session.id, path });
+    const entries = (
+      response.data as {
+        entries?: Array<{ name: string; kind: string }>;
+      } | null
+    )?.entries;
+    if (response.ok && entries) setRemoteFiles(entries);
+  };
   useEffect(() => {
     if (!session) return;
-    void api.sftpList({ session_id: session.id, path }).then((response) => {
-      const entries = (
-        response.data as {
-          entries?: Array<{ name: string; kind: string }>;
-        } | null
-      )?.entries;
-      if (entries) setRemoteFiles(entries);
-    });
+    void refreshDirectory();
+    // The directory is keyed by the active session and path; refreshDirectory
+    // is intentionally not a dependency because it is recreated per render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session, path]);
   useEffect(() => {
     setPath("~");
-    setRemoteFiles([]);
+    setRemoteFiles(undefined);
     setTransfers([]);
   }, [session?.id]);
   useEffect(() => {
@@ -755,10 +761,12 @@ function SftpPage({
             : item,
         ),
       );
+      if (payload.data.status === "completed") void refreshDirectory();
     });
     return () => {
       void listener.then((unlisten) => unlisten());
     };
+    /* eslint-disable-next-line react-hooks/exhaustive-deps */
   }, [session]);
   const start = async (request: Record<string, unknown>, name: string) => {
     if (!session) {
@@ -786,6 +794,7 @@ function SftpPage({
         progress: data?.status === "completed" ? 100 : 0,
       },
     ]);
+    if (data?.status === "completed") void refreshDirectory();
   };
   const createDirectory = () => {
     const name = window.prompt("新目录名称");
@@ -857,7 +866,7 @@ function SftpPage({
       filename,
     );
   };
-  const shownFiles = remoteFiles.length ? remoteFiles : fallback;
+  const shownFiles = remoteFiles ?? fallback;
   const parent =
     path === "~"
       ? "~"
