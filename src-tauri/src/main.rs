@@ -2645,7 +2645,7 @@ fn agent_message_send(
             }
         }
     }
-    let history = history_rows
+    let mut history = history_rows
         .into_iter()
         .map(|(role, content, tool_call)| {
             let body = content
@@ -2656,6 +2656,14 @@ fn agent_message_send(
         })
         .collect::<Vec<_>>()
         .join("\n");
+    const MAX_HISTORY_CHARS: usize = 64 * 1024;
+    let history_len = history.chars().count();
+    if history_len > MAX_HISTORY_CHARS {
+        history = history
+            .chars()
+            .skip(history_len - MAX_HISTORY_CHARS)
+            .collect();
+    }
     let model_user_text = if history.is_empty() {
         text.clone()
     } else {
