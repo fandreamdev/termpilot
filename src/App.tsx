@@ -100,8 +100,36 @@ export default function App() {
   const [agentOpen, setAgentOpen] = useState(true);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [theme, setTheme] = useState<"dark" | "light">("dark");
+  const [emergencyStopped, setEmergencyStopped] = useState(false);
   useEffect(() => {
     void api.hosts().then(setHosts);
+  }, []);
+  useEffect(() => {
+    const listener = api.on<{
+      data?: { scope?: string; session_id?: string };
+    }>(
+      "system.emergency_stop",
+      (payload) => {
+        setEmergencyStopped(true);
+        if (payload.data?.scope === "all") {
+          setSession(undefined);
+          setSessionTabs([]);
+        } else if (
+          payload.data?.scope === "session" &&
+          payload.data.session_id
+        ) {
+          setSessionTabs((tabs) =>
+            tabs.filter((tab) => tab.id !== payload.data?.session_id),
+          );
+          setSession((current) =>
+            current?.id === payload.data?.session_id ? undefined : current,
+          );
+        }
+      },
+    );
+    return () => {
+      void listener.then((unlisten) => unlisten());
+    };
   }, []);
   useEffect(() => {
     void api.appSettingsGet().then((response) => {
@@ -184,14 +212,31 @@ export default function App() {
         </nav>
         <div className="side-bottom">
           <button
-            className="stop"
+            className={"stop " + (emergencyStopped ? "stop-active" : "")}
             onClick={() => {
-              void api.emergencyStop();
-              window.alert("已阻断新命令、Agent 和 SFTP 操作");
+              if (emergencyStopped) {
+                if (!window.confirm("解除急停需要当前 Windows 用户确认，继续？"))
+                  return;
+                void api.emergencyStopClear().then((response) => {
+                  if (response.ok) {
+                    setEmergencyStopped(false);
+                    window.alert("急停已解除，请重新建立远程会话");
+                  } else window.alert(response.error?.message ?? "解除急停失败");
+                });
+                return;
+              }
+              void api.emergencyStop().then((response) => {
+                if (response.ok) {
+                  setEmergencyStopped(true);
+                  window.alert("已阻断新命令、Agent 和 SFTP 操作");
+                } else window.alert(response.error?.message ?? "急停失败");
+              });
             }}
           >
             <span className="stop-icon">■</span>
-            <span className="stop-label">紧急停止</span>
+            <span className="stop-label">
+              {emergencyStopped ? "解除急停" : "紧急停止"}
+            </span>
           </button>
           <button
             className="theme-toggle"
@@ -250,7 +295,12 @@ export default function App() {
         ) : page === "审计" ? (
           <AuditPage />
         ) : page === "设置" ? (
-          <SettingsPage theme={theme} setTheme={updateTheme} />
+          <SettingsPage
+            theme={theme}
+            setTheme={updateTheme}
+            emergencyStopped={emergencyStopped}
+            onEmergencyCleared={() => setEmergencyStopped(false)}
+          />
         ) : (
           <Dashboard hosts={hosts} connect={connect} />
         )}
@@ -672,6 +722,11 @@ function SftpPage({
     });
   }, [session, path]);
   useEffect(() => {
+    setPath("~");
+    setRemoteFiles([]);
+    setTransfers([]);
+  }, [session?.id]);
+  useEffect(() => {
     if (!session) return;
     const listener = api.on<{
       session_id?: string;
@@ -728,7 +783,7 @@ function SftpPage({
         id: data?.transfer_id ?? crypto.randomUUID(),
         name,
         status: data?.status ?? "completed",
-        progress: 100,
+        progress: data?.status === "completed" ? 100 : 0,
       },
     ]);
   };
@@ -965,24 +1020,40 @@ function SftpPage({
                     继续
                   </button>
                 )}
-                <button
-                  className="btn"
-                  onClick={() => void api.transferPause(item.id)}
-                >
-                  暂停
-                </button>
-                <button
-                  className="btn"
-                  onClick={() => void api.transferCancel(item.id)}
-                >
-                  取消
-                </button>
-                <button
-                  className="btn"
-                  onClick={() => void api.transferRetry(item.id, true)}
-                >
-                  重试
-                </button>
+                {item.status === "running" && (
+                  <button
+                    className="btn"
+                    onClick={() => void api.transferPause(item.id)}
+                  >
+                    暂停
+                  </button>
+                )}
+                {!["completed", "failed", "cancelled"].includes(
+                  item.status,
+                ) && (
+                  <button
+                    className="btn"
+                    onClick={() => void api.transferCancel(item.id)}
+                  >
+                    取消
+                  </button>
+                )}
+                {["failed", "cancelled"].includes(item.status) && (
+                  <button
+                    className="btn"
+                    onClick={() => {
+                      const needsConfirmation = production;
+                      if (
+                        needsConfirmation &&
+                        !window.confirm("生产主机将重试该传输，确认继续？")
+                      )
+                        return;
+                      void api.transferRetry(item.id, needsConfirmation);
+                    }}
+                  >
+                    重试
+                  </button>
+                )}
               </small>
             </div>
           ))}
@@ -1092,9 +1163,13 @@ function AuditPage() {
 function SettingsPage({
   theme,
   setTheme,
+  emergencyStopped,
+  onEmergencyCleared,
 }: {
   theme: "dark" | "light";
   setTheme: (t: "dark" | "light") => void;
+  emergencyStopped: boolean;
+  onEmergencyCleared: () => void;
 }) {
   const [policy, setPolicy] = useState("读取中…");
   useEffect(() => {
@@ -1132,6 +1207,18 @@ function SettingsPage({
           ? "恢复完成，请重启应用"
           : "恢复失败",
       );
+  };
+  const clearEmergencyStop = async () => {
+    if (
+      !emergencyStopped ||
+      !window.confirm("解除急停需要当前 Windows 用户确认，继续？")
+    )
+      return;
+    const response = await api.emergencyStopClear();
+    if (response.ok) {
+      onEmergencyCleared();
+      window.alert("急停已解除，请重新建立远程会话");
+    } else window.alert(response.error?.message ?? "解除急停失败");
   };
   return (
     <section className="content">
@@ -1198,6 +1285,20 @@ function SettingsPage({
           <p className="muted">
             密码、私钥和 Token 不会写入 SQLite、日志或模型请求。
           </p>
+          <p className="setting-line">
+            急停状态{" "}
+            <span className={"badge " + (emergencyStopped ? "red" : "green")}>
+              {emergencyStopped ? "已启用" : "正常"}
+            </span>
+          </p>
+          {emergencyStopped && (
+            <button
+              className="btn red"
+              onClick={() => void clearEmergencyStop()}
+            >
+              解除急停
+            </button>
+          )}
         </div>
       </div>
     </section>
@@ -1630,6 +1731,7 @@ function Terminal({
                 >
                   <option value="ask_before_execute">需审批</option>
                   <option value="readonly">只读</option>
+                  <option value="allow_safe_commands">允许安全命令</option>
                   <option value="manual_only">仅建议</option>
                 </select>
                 <button className="btn" onClick={() => setOpen(false)}>

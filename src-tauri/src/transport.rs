@@ -533,16 +533,41 @@ struct SftpEndpoint {
 pub struct OpenSftpTransport {
     sessions: Mutex<HashMap<String, SftpEndpoint>>,
     cancelled: Mutex<HashSet<String>>,
+    child_pids: Arc<Mutex<HashMap<String, HashSet<u32>>>>,
 }
 impl Default for OpenSftpTransport {
     fn default() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
             cancelled: Mutex::new(HashSet::new()),
+            child_pids: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
 impl OpenSftpTransport {
+    fn kill_pid(pid: u32) {
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .output();
+        }
+        #[cfg(not(windows))]
+        let _ = pid;
+    }
+
+    fn kill_session_children(&self, session_id: &str) {
+        let pids = self
+            .child_pids
+            .lock()
+            .ok()
+            .and_then(|mut values| values.remove(session_id))
+            .unwrap_or_default();
+        for pid in pids {
+            Self::kill_pid(pid);
+        }
+    }
+
     fn batch(&self, session_id: &str, commands: &[String]) -> Result<String, TransportError> {
         let endpoint = self
             .sessions
@@ -595,6 +620,11 @@ impl OpenSftpTransport {
         }
         const MAX_BATCH_OUTPUT: usize = 8 * 1024 * 1024;
         let pid = child.id();
+        if let Ok(mut values) = self.child_pids.lock() {
+            values.entry(session_id.to_owned()).or_default().insert(pid);
+        }
+        let child_pids = self.child_pids.clone();
+        let child_session = session_id.to_owned();
         let mut stdout = child
             .stdout
             .take()
@@ -611,6 +641,14 @@ impl OpenSftpTransport {
                         if n > remaining {
                             let _ = child.kill();
                             let _ = child.wait();
+                            if let Ok(mut values) = child_pids.lock() {
+                                if let Some(pids) = values.get_mut(&child_session) {
+                                    pids.remove(&pid);
+                                    if pids.is_empty() {
+                                        values.remove(&child_session);
+                                    }
+                                }
+                            }
                             let _ = sender.send(Err(TransportError::Unavailable(
                                 "sftp output limit exceeded".into(),
                             )));
@@ -621,6 +659,14 @@ impl OpenSftpTransport {
                     Err(_) => {
                         let _ = child.kill();
                         let _ = child.wait();
+                        if let Ok(mut values) = child_pids.lock() {
+                            if let Some(pids) = values.get_mut(&child_session) {
+                                pids.remove(&pid);
+                                if pids.is_empty() {
+                                    values.remove(&child_session);
+                                }
+                            }
+                        }
                         let _ = sender.send(Err(TransportError::Unavailable(
                             "sftp stdout read failed".into(),
                         )));
@@ -638,19 +684,21 @@ impl OpenSftpTransport {
                         Err(TransportError::Unavailable("sftp operation failed".into()))
                     }
                 });
+            if let Ok(mut values) = child_pids.lock() {
+                if let Some(pids) = values.get_mut(&child_session) {
+                    pids.remove(&pid);
+                    if pids.is_empty() {
+                        values.remove(&child_session);
+                    }
+                }
+            }
             let _ = sender.send(result);
         });
         match receiver.recv_timeout(std::time::Duration::from_secs(600)) {
             Ok(result) => result,
             Err(_) => {
-                #[cfg(windows)]
-                {
-                    let _ = Command::new("taskkill")
-                        .args(["/PID", &pid.to_string(), "/T", "/F"])
-                        .output();
-                }
-                #[cfg(not(windows))]
-                let _ = pid;
+                Self::kill_pid(pid);
+                self.kill_session_children(session_id);
                 Err(TransportError::Timeout)
             }
         }
@@ -687,11 +735,23 @@ impl SftpTransport for OpenSftpTransport {
         }
     }
     fn unregister_session(&self, session_id: &str) {
+        self.kill_session_children(session_id);
         if let Ok(mut sessions) = self.sessions.lock() {
             sessions.remove(session_id);
         }
     }
     fn close_all(&self) {
+        let sessions = self
+            .child_pids
+            .lock()
+            .ok()
+            .map(|mut values| std::mem::take(&mut *values))
+            .unwrap_or_default();
+        for pids in sessions.values() {
+            for pid in pids {
+                Self::kill_pid(*pid);
+            }
+        }
         if let Ok(mut sessions) = self.sessions.lock() {
             sessions.clear();
         }
