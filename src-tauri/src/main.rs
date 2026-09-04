@@ -3198,6 +3198,14 @@ fn database_restore(state: State<'_, AppState>, request: Value) -> Envelope<Valu
     if let Ok(mut stopped) = state.stopped_sessions.lock() {
         stopped.clear();
     }
+    if let Ok(mut cache) = state.credential_cache.lock() {
+        cache.clear();
+    }
+    if let Ok(mut targets) = state.session_credential_targets.lock() {
+        for target in targets.drain() {
+            let _ = credentials::delete_password(&target);
+        }
+    }
     if db::append_audit(
         &conn,
         "database.restore",
