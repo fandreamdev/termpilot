@@ -2707,11 +2707,21 @@ fn agent_message_send(
         .as_ref()
         .map(|model| model.provider.clone())
         .unwrap_or_else(|| "mock".to_owned());
-    let _ = conn.execute("INSERT OR IGNORE INTO agent_conversations(id,session_id,model_provider,status,created_at,updated_at) VALUES(?,?,?,?,?,?)", rusqlite::params![conversation_id,session_id,provider,"active",now,now]);
-    let _ = conn.execute(
-        "INSERT INTO agent_messages(conversation_id,role,content,created_at) VALUES(?,?,?,?)",
-        rusqlite::params![conversation_id, "user", text.clone(), now],
-    );
+    if conn
+        .execute("INSERT OR IGNORE INTO agent_conversations(id,session_id,model_provider,status,created_at,updated_at) VALUES(?,?,?,?,?,?)", rusqlite::params![conversation_id,session_id,provider,"active",now,now])
+        .is_err()
+    {
+        return err("AUDIT_UNAVAILABLE", "无法保存 Agent 会话，已阻止请求");
+    }
+    if conn
+        .execute(
+            "INSERT INTO agent_messages(conversation_id,role,content,created_at) VALUES(?,?,?,?)",
+            rusqlite::params![conversation_id, "user", text.clone(), now],
+        )
+        .is_err()
+    {
+        return err("AUDIT_UNAVAILABLE", "无法保存 Agent 消息，已阻止请求");
+    }
     let context = db::session_context(&conn, &session_id)
         .map(|(user, address, host, _)| {
             format!("host={host}; address={address}; user={user}; cwd=~")
@@ -2857,8 +2867,8 @@ fn run_agent_task(
         }
         return;
     };
-    if let Some(tool_call_json) = normalized_agent_tool_call(&response) {
-        let _ = conn.execute(
+    let persisted = if let Some(tool_call_json) = normalized_agent_tool_call(&response) {
+        conn.execute(
             "INSERT INTO agent_messages(conversation_id,role,tool_call_json,created_at) VALUES(?,?,?,?)",
             rusqlite::params![
                 conversation_id,
@@ -2866,9 +2876,9 @@ fn run_agent_task(
                 tool_call_json,
                 Utc::now().to_rfc3339()
             ],
-        );
+        )
     } else {
-        let _ = conn.execute(
+        conn.execute(
             "INSERT INTO agent_messages(conversation_id,role,content,created_at) VALUES(?,?,?,?)",
             rusqlite::params![
                 conversation_id,
@@ -2876,7 +2886,28 @@ fn run_agent_task(
                 response.clone(),
                 Utc::now().to_rfc3339()
             ],
+        )
+    };
+    if persisted.is_err() {
+        // A tool-call result must never be dispatched when its durable
+        // conversation record could not be written. Fail closed and surface a
+        // bounded diagnostic instead of allowing an un-audited remote action.
+        let _ = conn.execute(
+            "UPDATE agent_conversations SET status='error',updated_at=? WHERE id=?",
+            rusqlite::params![Utc::now().to_rfc3339(), conversation_id],
         );
+        let seq = next_seq_for(&event_seq, &session_id, "agent");
+        let _ = app.emit(
+            "agent.delta",
+            json!({"event":"agent.delta","version":1,"seq":seq,"session_id":session_id,"correlation_id":task_id,"occurred_at":Utc::now().to_rfc3339(),"data":{"task_id":task_id,"conversation_id":conversation_id,"status":"error","delta":"Agent 结果无法写入本地审计，已阻止后续工具操作。"}}),
+        );
+        if let Ok(mut items) = cancelled.lock() {
+            items.remove(&task_id);
+        }
+        if let Ok(mut active) = tasks.lock() {
+            active.remove(&task_id);
+        }
+        return;
     }
     let conversation_status = match model_status {
         "completed" => "completed",
