@@ -201,3 +201,5 @@ CREATE TABLE audit_exports(
 ## 3. 迁移和验收
 
 首版迁移创建以上表和默认 `ask_before_execute` 策略。删除或损坏数据库时，应用只允许查看诊断和重新初始化，不得自动执行远程命令。验收重点是秘密零落盘、指纹变化阻断、审批不可重放、审计链可验证和 SFTP 路径不越界。
+
+当前迁移文件为 `001_init.sql`（基线 DDL）和 `002_status_completed.sql`（将旧版 `succeeded` 映射为 `completed` 并补充凭据唯一索引）。每个迁移以 SHA-256 checksum 记录在 `schema_migrations`；发现已应用迁移内容漂移时，应用安全失败而不执行远程操作。

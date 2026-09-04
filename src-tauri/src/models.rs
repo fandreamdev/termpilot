@@ -25,6 +25,8 @@ pub struct HostUpsert {
     pub group_name: Option<String>,
     pub is_production: bool,
     pub policy_id: String,
+    pub endpoint_fingerprint: Option<String>,
+    pub notes: Option<String>,
 }
 #[derive(Debug, Serialize)]
 pub struct Session {

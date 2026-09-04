@@ -3,7 +3,13 @@ use crate::models::{Host, HostUpsert};
 use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
-use std::{fs, path::PathBuf};
+use sha2::Digest;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+pub type SftpOperation = (String, String, Option<String>, Option<String>, String);
 
 pub fn open() -> rusqlite::Result<Connection> {
     let dir = std::env::var_os("LOCALAPPDATA")
@@ -20,10 +26,50 @@ pub fn open() -> rusqlite::Result<Connection> {
         "UPDATE sftp_operations SET status='completed' WHERE status='succeeded'",
         [],
     )?;
+    let checksum = hex::encode(sha2::Sha256::digest(
+        include_str!("../migrations/001_init.sql").as_bytes(),
+    ));
+    let existing: Option<String> = c
+        .query_row(
+            "SELECT checksum FROM schema_migrations WHERE version=1",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(previous) = existing {
+        // Databases created by the initial development build used a marker rather
+        // than a content hash. Upgrade that marker once; reject unknown drift.
+        if previous != checksum && previous != "001_init_sql_v2" {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+    }
+    c.execute(
+        "INSERT INTO schema_migrations(version,checksum,applied_at) VALUES(?,?,?) ON CONFLICT(version) DO UPDATE SET checksum=excluded.checksum",
+        params![1, checksum, Utc::now().to_rfc3339()],
+    )?;
+    let migration2 = include_str!("../migrations/002_status_completed.sql");
+    let checksum2 = hex::encode(sha2::Sha256::digest(migration2.as_bytes()));
+    let existing2: Option<String> = c
+        .query_row(
+            "SELECT checksum FROM schema_migrations WHERE version=2",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    if let Some(previous) = existing2 {
+        if previous != checksum2 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+    }
+    c.execute_batch(migration2)?;
     c.execute(
         "INSERT OR IGNORE INTO schema_migrations(version,checksum,applied_at) VALUES(?,?,?)",
-        params![1, "001_init_sql_v2", Utc::now().to_rfc3339()],
+        params![2, checksum2, Utc::now().to_rfc3339()],
     )?;
+    let now = Utc::now().to_rfc3339();
+    c.execute("INSERT OR IGNORE INTO app_settings(key,value,value_type,updated_at) VALUES('theme','dark','string',?)", params![now])?;
+    c.execute("INSERT OR IGNORE INTO app_settings(key,value,value_type,updated_at) VALUES('audit.retention_days','90','integer',?)", params![now])?;
+    c.execute("INSERT OR IGNORE INTO app_settings(key,value,value_type,updated_at) VALUES('remote.default_path','~','string',?)", params![now])?;
     Ok(c)
 }
 pub fn hosts(c: &Connection) -> rusqlite::Result<Vec<Host>> {
@@ -78,6 +124,52 @@ pub fn host_exists(c: &Connection, id: &str) -> rusqlite::Result<bool> {
 pub fn session_exists(c: &Connection, id: &str) -> rusqlite::Result<bool> {
     c.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE id=? AND status NOT IN('closed','disconnected','error'))",[id],|r|r.get(0))
 }
+pub fn session_context(
+    c: &Connection,
+    id: &str,
+) -> rusqlite::Result<(String, String, String, String)> {
+    c.query_row(
+        "SELECT h.username,h.address,h.name,COALESCE(s.observed_remote_identity_hmac,'') FROM sessions s JOIN hosts h ON h.id=s.host_id WHERE s.id=? AND s.status NOT IN('closed','disconnected','error')",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )
+}
+pub fn session_policy(c: &Connection, id: &str) -> rusqlite::Result<(String, i64, String)> {
+    c.query_row(
+        "SELECT p.id,p.version,p.mode FROM sessions s JOIN hosts h ON h.id=s.host_id JOIN security_policies p ON p.id=h.policy_id WHERE s.id=?",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+}
+pub fn policy(c: &Connection, id: &str) -> rusqlite::Result<(i64, String, String)> {
+    c.query_row(
+        "SELECT version,allow_rules_json,mode FROM security_policies WHERE id=? AND is_active=1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+}
+pub fn host_policy_exists(c: &Connection, id: &str) -> rusqlite::Result<bool> {
+    c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM security_policies WHERE id=? AND is_active=1)",
+        [id],
+        |r| r.get(0),
+    )
+}
+pub fn credential_host_exists(c: &Connection, host_id: &str) -> rusqlite::Result<bool> {
+    c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM hosts WHERE id=? AND deleted_at IS NULL)",
+        [host_id],
+        |r| r.get(0),
+    )
+}
+pub fn update_session_observed(
+    c: &Connection,
+    id: &str,
+    fingerprint: Option<&str>,
+    identity: Option<&str>,
+) -> rusqlite::Result<usize> {
+    c.execute("UPDATE sessions SET observed_endpoint_fingerprint=?,observed_remote_identity_hmac=? WHERE id=?", params![fingerprint,identity,id])
+}
 pub fn has_active_session(c: &Connection, host_id: &str) -> rusqlite::Result<bool> {
     c.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE host_id=? AND status IN('connecting','ready','reconnecting'))",[host_id],|r|r.get(0))
 }
@@ -107,6 +199,9 @@ pub fn disconnect_session(
     reason: Option<&str>,
 ) -> rusqlite::Result<bool> {
     Ok(c.execute("UPDATE sessions SET status='closed',ended_at=?,disconnect_reason=? WHERE id=? AND status NOT IN('closed','disconnected')",params![Utc::now().to_rfc3339(),reason,id])? == 1)
+}
+pub fn close_all_sessions(c: &Connection, reason: &str) -> rusqlite::Result<usize> {
+    c.execute("UPDATE sessions SET status='closed',ended_at=?,disconnect_reason=? WHERE status IN('connecting','ready','reconnecting')", params![Utc::now().to_rfc3339(),reason])
 }
 pub fn append_audit(
     c: &Connection,
@@ -145,6 +240,19 @@ pub fn insert_sftp(
     }
     c.execute("INSERT INTO sftp_operations(id,session_id,operation,source_path,destination_path,status,created_at) VALUES(?,?,?,?,?,'queued',?)",params![id,session_id,op,src,dst,Utc::now().to_rfc3339()])
 }
+pub fn sftp_operation(c: &Connection, id: &str) -> rusqlite::Result<SftpOperation> {
+    c.query_row("SELECT session_id,operation,source_path,destination_path,status FROM sftp_operations WHERE id=?", [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))
+}
+pub fn update_sftp_progress(
+    c: &Connection,
+    id: &str,
+    transferred: i64,
+    size: Option<i64>,
+    content_hash: Option<&str>,
+    error_code: Option<&str>,
+) -> rusqlite::Result<usize> {
+    c.execute("UPDATE sftp_operations SET transferred_bytes=?,size_bytes=COALESCE(?,size_bytes),content_hash=COALESCE(?,content_hash),error_code=? WHERE id=?", params![transferred,size,content_hash,error_code,id])
+}
 pub fn update_sftp_status(c: &Connection, id: &str, status: &str) -> rusqlite::Result<usize> {
     let n=c.execute("UPDATE sftp_operations SET status=?,started_at=CASE WHEN ?='running' AND started_at IS NULL THEN ? ELSE started_at END,ended_at=CASE WHEN ? IN('completed','failed','cancelled') THEN ? ELSE ended_at END WHERE id=? AND status NOT IN('completed','failed','cancelled')",params![status,status,Utc::now().to_rfc3339(),status,Utc::now().to_rfc3339(),id])?;
     if n == 0 {
@@ -157,7 +265,7 @@ pub fn upsert(c: &Connection, h: &HostUpsert) -> rusqlite::Result<String> {
         h.id.clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let now = Utc::now().to_rfc3339();
-    c.execute("INSERT INTO hosts(id,name,connection_type,address,port,username,auth_method,group_name,is_production,policy_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,connection_type=excluded.connection_type,address=excluded.address,port=excluded.port,username=excluded.username,auth_method=excluded.auth_method,group_name=excluded.group_name,is_production=excluded.is_production,policy_id=excluded.policy_id,updated_at=excluded.updated_at", params![id,h.name,h.connection_type,h.address,h.port,h.username,h.auth_method,h.group_name,h.is_production as i32,h.policy_id,now,now])?;
+    c.execute("INSERT INTO hosts(id,name,connection_type,address,port,username,auth_method,group_name,is_production,endpoint_fingerprint,policy_id,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,connection_type=excluded.connection_type,address=excluded.address,port=excluded.port,username=excluded.username,auth_method=excluded.auth_method,group_name=excluded.group_name,is_production=CASE WHEN hosts.is_production=1 THEN 1 ELSE excluded.is_production END,endpoint_fingerprint=COALESCE(excluded.endpoint_fingerprint,hosts.endpoint_fingerprint),policy_id=excluded.policy_id,notes=excluded.notes,updated_at=excluded.updated_at", params![id,h.name,h.connection_type,h.address,h.port,h.username,h.auth_method,h.group_name,h.is_production as i32,h.endpoint_fingerprint,h.policy_id,h.notes,now,now])?;
     Ok(id)
 }
 pub fn delete(c: &Connection, id: &str) -> rusqlite::Result<bool> {
@@ -165,4 +273,101 @@ pub fn delete(c: &Connection, id: &str) -> rusqlite::Result<bool> {
         "UPDATE hosts SET deleted_at=? WHERE id=? AND deleted_at IS NULL",
         params![Utc::now().to_rfc3339(), id],
     )? == 1)
+}
+
+pub fn set_setting(
+    c: &Connection,
+    key: &str,
+    value: &str,
+    value_type: &str,
+) -> rusqlite::Result<()> {
+    let lower = key.to_ascii_lowercase();
+    if [
+        "password",
+        "token",
+        "secret",
+        "private_key",
+        "api_key",
+        "credential",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "secret setting".into(),
+        ));
+    }
+    let value_lower = value.to_ascii_lowercase();
+    if value_lower.contains("-----begin")
+        || value_lower.contains("password=")
+        || value_lower.contains("token=")
+        || value_lower.contains("api_key=")
+    {
+        return Err(rusqlite::Error::InvalidParameterName("secret value".into()));
+    }
+    if key.is_empty() || key.len() > 128 || value.len() > 16 * 1024 {
+        return Err(rusqlite::Error::InvalidParameterName("setting".into()));
+    }
+    c.execute("INSERT INTO app_settings(key,value,value_type,updated_at) VALUES(?,?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,value_type=excluded.value_type,updated_at=excluded.updated_at", params![key,value,value_type,Utc::now().to_rfc3339()])?;
+    Ok(())
+}
+pub fn get_settings(c: &Connection) -> rusqlite::Result<Vec<(String, String, String, String)>> {
+    let mut s =
+        c.prepare("SELECT key,value,value_type,updated_at FROM app_settings ORDER BY key")?;
+    let rows = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+    rows.collect()
+}
+pub fn backup(c: &Connection, path: &Path) -> rusqlite::Result<()> {
+    if path.extension().and_then(|v| v.to_str()) != Some("db") {
+        return Err(rusqlite::Error::InvalidPath(path.to_path_buf()));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|_| rusqlite::Error::InvalidPath(parent.to_path_buf()))?;
+    }
+    let escaped = path.to_string_lossy().replace('\'', "''");
+    c.execute_batch(&format!(
+        "PRAGMA wal_checkpoint(TRUNCATE); VACUUM INTO '{}';",
+        escaped
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_and_audit_chain_are_usable() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(include_str!("../migrations/001_init.sql"))
+            .unwrap();
+        let first = append_audit(
+            &c,
+            "test.one",
+            "info",
+            "user",
+            None,
+            None,
+            &json!({"ok":true}),
+        )
+        .unwrap();
+        let second =
+            append_audit(&c, "test.two", "info", "user", None, None, &json!({"n":2})).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            c.query_row("SELECT COUNT(*) FROM audit_logs", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT prev_hash FROM audit_logs ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            first
+        );
+    }
 }

@@ -19,6 +19,13 @@ pub fn validate_host(
     }
     Ok(())
 }
+pub fn validate_fingerprint(value: &str) -> bool {
+    let value = value.strip_prefix("SHA256:").unwrap_or(value);
+    (16..=128).contains(&value.len())
+        && value
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '/')
+}
 pub fn is_fixed_readonly(argv: &[String]) -> bool {
     matches!(argv, [p, a] if (p == "df" && a == "-h"))
         || matches!(argv, [p] if p == "pwd" || p == "whoami")
@@ -30,9 +37,114 @@ pub fn sanitize_text(input: &str) -> String {
         .take(32_000)
         .collect()
 }
+pub fn redact_sensitive(input: &str) -> String {
+    sanitize_text(input)
+        .lines()
+        .map(|line| {
+            let lower = line.to_ascii_lowercase();
+            if [
+                "password",
+                "passwd",
+                "token",
+                "secret",
+                "private_key",
+                "api_key",
+                "authorization",
+                "cookie",
+            ]
+            .iter()
+            .any(|needle| lower.contains(needle))
+            {
+                "[REDACTED]"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 pub fn validate_structured_command(value: &Value) -> bool {
-    value.get("program").and_then(Value::as_str).is_some()
-        && value.get("args").and_then(Value::as_array).is_some()
+    let Some(program) = value.get("program").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(args) = value.get("args").and_then(Value::as_array) else {
+        return false;
+    };
+    !program.is_empty()
+        && program.len() <= 256
+        && !is_forbidden_program(program)
+        && args.len() <= 64
+        && args.iter().all(|arg| {
+            arg.as_str()
+                .map(|s| !s.is_empty() && s.len() <= 4096 && !contains_shell_metacharacters(s))
+                .unwrap_or(false)
+        })
+}
+
+fn contains_shell_metacharacters(value: &str) -> bool {
+    value
+        .chars()
+        .any(|c| matches!(c, '\0' | '\n' | '\r' | '|' | ';' | '&' | '>' | '<' | '`'))
+}
+
+pub fn is_forbidden_program(program: &str) -> bool {
+    matches!(
+        program,
+        "sh" | "bash"
+            | "zsh"
+            | "fish"
+            | "cmd"
+            | "powershell"
+            | "pwsh"
+            | "ssh"
+            | "sudo"
+            | "eval"
+            | "xargs"
+    )
+}
+
+pub fn command_risk(argv: &[String]) -> &'static str {
+    if argv.is_empty()
+        || is_forbidden_program(&argv[0])
+        || argv.iter().any(|arg| contains_shell_metacharacters(arg))
+    {
+        return "blocked";
+    }
+    if is_fixed_readonly(argv) {
+        "low"
+    } else {
+        "medium"
+    }
+}
+
+pub fn rule_matches(
+    rule: &Value,
+    argv: &[String],
+    host_id: &str,
+    remote_user: &str,
+    cwd: &str,
+) -> bool {
+    let program_ok = rule
+        .get("program")
+        .and_then(Value::as_str)
+        .map(|v| argv.first().map(String::as_str) == Some(v))
+        .unwrap_or(false);
+    let args_ok = rule
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|expected| {
+            expected.len() == argv.len().saturating_sub(1)
+                && expected
+                    .iter()
+                    .zip(argv.iter().skip(1))
+                    .all(|(a, b)| a.as_str() == Some(b))
+        })
+        .unwrap_or(false);
+    program_ok
+        && args_ok
+        && rule.get("host_id").and_then(Value::as_str) == Some(host_id)
+        && rule.get("remote_user").and_then(Value::as_str) == Some(remote_user)
+        && rule.get("cwd").and_then(Value::as_str) == Some(cwd)
 }
 
 #[cfg(test)]
@@ -65,5 +177,16 @@ mod tests {
         assert!(!validate_structured_command(
             &serde_json::json!({"program":"pwd"})
         ));
+        assert!(!validate_structured_command(
+            &serde_json::json!({"program":"sh","args":["-c","pwd"]})
+        ));
+        assert_eq!(
+            command_risk(&["rm".into(), "-rf".into(), "/".into()]),
+            "medium"
+        );
+        assert_eq!(
+            command_risk(&["bash".into(), "-c".into(), "pwd".into()]),
+            "blocked"
+        );
     }
 }

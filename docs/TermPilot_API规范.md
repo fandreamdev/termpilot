@@ -79,11 +79,27 @@ ID 使用 UUID/ULID；时间使用 UTC RFC3339；长任务返回任务 ID；所�
 
 请求 `{session_id,op,src?,dst?,overwrite?:boolean,resume?:boolean}`。`op` 为 `upload|download|delete|rename|mkdir`；单文件上限 20 GiB；本地路径必须由用户按次选择并通过路径校验。生产文件覆盖、删除和上传默认需要人工确认。
 
-返回 `{transfer_id,status:"queued"}`。`transfer_id` 与数据库 `sftp_operations.id` 相同。
+返回 `{transfer_id,status:"queued"|"running"|"completed"}`。`transfer_id` 与数据库 `sftp_operations.id` 相同；长任务通过 `transfer.progress` 事件报告进度。
 
 ### `transfer_pause|transfer_resume|transfer_cancel`
 
 请求 `{transfer_id,reason?}`。取消和暂停不删除临时文件；完成状态为 `completed|failed|cancelled`。下载支持按大小和 SHA-256 续传；上传只有在服务端确认安全 append 且用户确认时续传。
+
+### `transfer_retry`
+
+请求 `{transfer_id,confirmed?}`。仅对失败或取消的任务重新建立传输，并重新执行路径、覆盖和生产确认校验，返回新的 `transfer_id`。
+
+### `list_remote_directory`
+
+请求 `{session_id,path?:string,limit?:number}`，`path` 缺省为 `~`。返回目录项名称和 `file|directory` 类型，与 SFTP 使用同一越界校验。
+
+### `read_remote_file`
+
+请求 `{session_id,path,max_bytes?}`。响应仅返回经脱敏和大小限制的文本、SHA-256 与截断标记；文件正文不写入数据库、日志或模型上下文。
+
+### `upload_file|download_file`
+
+分别是 `sftp_transfer_start` 的受限封装，强制 `op=upload|download`；本地路径必须为用户按次选择的绝对路径，下载使用随机临时文件并在同一目录原子替换。
 
 ## 5. 策略、Agent 和审批
 
@@ -120,6 +136,18 @@ Agent 工具仅保留：`get_terminal_context`、`run_read_only_command`、`prop
 ### `audit_export_verify`
 
 离线验证文件 SHA-256 和审计链。
+
+### `audit_list`
+
+请求 `{limit?:number}`，返回本地脱敏审计事件列表，仅供当前用户界面展示。
+
+### `app_settings_get|app_settings_set`
+
+读写 `app_settings` 中的非秘密设置。写入请求为 `{key,value,value_type}`，禁止保存密码、Token、私钥或 API Key。
+
+### `database_backup|database_restore`
+
+备份请求 `{path}`，使用 SQLite `VACUUM INTO` 生成一致性 `.db` 文件。恢复请求 `{path,confirmed:true}`，恢复前必须由当前用户明确确认；两者均写入审计。
 
 ### `emergency_stop`
 
