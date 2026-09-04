@@ -393,13 +393,22 @@ function HostsPage({
     }
     const target = String(form.get("target_name") ?? "");
     const secret = String(form.get("secret") ?? "");
-    if (value.auth_method !== "ssh_agent" && target) {
+    const retention = String(form.get("retention_mode") ?? "app_session");
+    if (value.auth_method === "private_key" && !target) {
+      window.alert("私钥认证必须填写本地绝对路径。");
+      return;
+    }
+    if (value.auth_method === "password" && !secret) {
+      window.alert("密码认证必须填写本次密码。");
+      return;
+    }
+    if (value.auth_method !== "ssh_agent") {
       const credential = await api.credentialStore({
         host_id: value.id,
         kind: value.auth_method,
-        target_name: target,
+        target_name: target || undefined,
         secret: secret || undefined,
-        retention_mode: "app_session",
+        retention_mode: retention,
       });
       if (!credential.ok && !import.meta.env.DEV) {
         window.alert(credential.error?.message ?? "凭据保存失败");
@@ -520,6 +529,13 @@ function HostsPage({
             <label>
               本次密码
               <input name="secret" type="password" autoComplete="off" />
+            </label>
+            <label>
+              密码保存
+              <select name="retention_mode" defaultValue="app_session">
+                <option value="never">不保存（仅本次运行内存）</option>
+                <option value="app_session">本次应用运行（系统凭据库）</option>
+              </select>
             </label>
             <label className="check">
               <input
