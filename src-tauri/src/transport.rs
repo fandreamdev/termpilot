@@ -46,7 +46,13 @@ pub trait SshTransport: Send + Sync {
     ) -> Result<String, TransportError> {
         self.connect(host, port, user)
     }
-    fn start_output_pump(&self, _session_id: &str, _app: AppHandle) {}
+    fn start_output_pump(
+        &self,
+        _session_id: &str,
+        _app: AppHandle,
+        _on_disconnect: Arc<dyn Fn(&str) + Send + Sync>,
+    ) {
+    }
     fn send_input(&self, session_id: &str, bytes: &[u8]) -> Result<usize, TransportError>;
     fn execute_structured(
         &self,
@@ -399,7 +405,12 @@ impl SshTransport for OpenSshTransport {
         stdout.truncate(max_output);
         Ok((stdout, output.status.code().unwrap_or(1)))
     }
-    fn start_output_pump(&self, session_id: &str, app: AppHandle) {
+    fn start_output_pump(
+        &self,
+        session_id: &str,
+        app: AppHandle,
+        on_disconnect: Arc<dyn Fn(&str) + Send + Sync>,
+    ) {
         let Ok(mut children) = self.children.lock() else {
             return;
         };
@@ -410,6 +421,7 @@ impl SshTransport for OpenSshTransport {
             return;
         };
         let id = session_id.to_owned();
+        let on_disconnect_for_task = on_disconnect.clone();
         let sequence = AtomicU64::new(1);
         std::thread::spawn(move || {
             let mut buffer = [0u8; 8192];
@@ -418,6 +430,7 @@ impl SshTransport for OpenSshTransport {
                     Ok(0) | Err(_) => {
                         let seq = sequence.fetch_add(1, Ordering::SeqCst) + 1;
                         let _ = app.emit("session.status", serde_json::json!({"event":"session.status","version":1,"seq":seq,"session_id":id,"correlation_id":id,"occurred_at":chrono::Utc::now().to_rfc3339(),"data":{"status":"disconnected"}}));
+                        on_disconnect_for_task(&id);
                         break;
                     }
                     Ok(n) => {
@@ -682,22 +695,25 @@ impl SftpTransport for OpenSftpTransport {
     ) -> Result<Vec<u8>, TransportError> {
         let temp =
             std::env::temp_dir().join(format!("termpilot-read-{}.tmp", uuid::Uuid::new_v4()));
-        let _ = self.batch(
-            session_id,
-            &[format!(
-                "get {} {}",
-                sftp_quote(path),
-                sftp_quote(&temp.to_string_lossy())
-            )],
-        )?;
-        let file =
-            std::fs::File::open(&temp).map_err(|e| TransportError::Unavailable(e.to_string()))?;
-        let mut bytes = Vec::new();
-        file.take(max_bytes as u64)
-            .read_to_end(&mut bytes)
-            .map_err(|e| TransportError::Unavailable(e.to_string()))?;
+        let result = (|| {
+            self.batch(
+                session_id,
+                &[format!(
+                    "get {} {}",
+                    sftp_quote(path),
+                    sftp_quote(&temp.to_string_lossy())
+                )],
+            )?;
+            let file = std::fs::File::open(&temp)
+                .map_err(|e| TransportError::Unavailable(e.to_string()))?;
+            let mut bytes = Vec::new();
+            file.take(max_bytes as u64)
+                .read_to_end(&mut bytes)
+                .map_err(|e| TransportError::Unavailable(e.to_string()))?;
+            Ok(bytes)
+        })();
         let _ = std::fs::remove_file(temp);
-        Ok(bytes)
+        result
     }
     fn write_file(
         &self,

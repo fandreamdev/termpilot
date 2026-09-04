@@ -27,6 +27,7 @@
 .side nav button{display:flex;align-items:center;gap:14px;height:44px;padding:0 14px;border-radius:13px;color:#b7c3d8;font-size:14px;transition:background .16s,color .16s}
 .side nav button.active{background:#0d2d3c;color:#21d5c2}
 .side nav button:hover{background:#16263d;color:#edf5ff}
+.term-search{width:110px;min-width:0;padding:6px 8px;border:1px solid #2b3b5d;border-radius:6px;background:#0d1528;color:#edf2ff;outline:0;font:12px "Segoe UI",sans-serif}.theme-light .term-search{background:#fff;color:#24344a;border-color:#cbd8e6}
 .file-row{display:flex;align-items:center;gap:8px;padding:8px 5px}
 .file-main{display:grid;grid-template-columns:28px minmax(100px,1fr) auto;gap:8px;align-items:center;flex:1;min-width:0;border:0;background:transparent;color:inherit;text-align:left;padding:5px;cursor:pointer}
 .file-actions{display:flex;gap:5px;flex:0 0 auto}

@@ -21,7 +21,12 @@ pub fn open() -> rusqlite::Result<Connection> {
     c.pragma_update(None, "journal_mode", "WAL")?;
     c.pragma_update(None, "foreign_keys", true)?;
     c.busy_timeout(std::time::Duration::from_secs(5))?;
-    c.execute_batch(include_str!("../migrations/001_init.sql"))?;
+    c.execute_batch("BEGIN IMMEDIATE;")?;
+    if let Err(error) = c.execute_batch(include_str!("../migrations/001_init.sql")) {
+        let _ = c.execute_batch("ROLLBACK;");
+        return Err(error);
+    }
+    c.execute_batch("COMMIT;")?;
     c.execute(
         "UPDATE sftp_operations SET status='completed' WHERE status='succeeded'",
         [],
@@ -424,6 +429,30 @@ pub fn validate_backup(path: &Path) -> rusqlite::Result<()> {
     if migration_version < 2 {
         return Err(rusqlite::Error::InvalidQuery);
     }
+    let expected_checksums = [
+        (
+            1_i64,
+            hex::encode(sha2::Sha256::digest(
+                include_str!("../migrations/001_init.sql").as_bytes(),
+            )),
+        ),
+        (
+            2_i64,
+            hex::encode(sha2::Sha256::digest(
+                include_str!("../migrations/002_status_completed.sql").as_bytes(),
+            )),
+        ),
+    ];
+    for (version, expected) in expected_checksums {
+        let checksum: String = backup.query_row(
+            "SELECT checksum FROM schema_migrations WHERE version=?",
+            [version],
+            |r| r.get(0),
+        )?;
+        if checksum != expected && !(version == 1 && checksum == "001_init_sql_v2") {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+    }
     Ok(())
 }
 
@@ -474,8 +503,13 @@ mod tests {
         c.execute_batch(include_str!("../migrations/002_status_completed.sql"))
             .unwrap();
         c.execute(
-            "INSERT INTO schema_migrations(version,checksum,applied_at) VALUES(2,'test',datetime('now'))",
-            [],
+            "INSERT INTO schema_migrations(version,checksum,applied_at) VALUES(1,?,datetime('now'))",
+            [hex::encode(sha2::Sha256::digest(include_str!("../migrations/001_init.sql").as_bytes()))],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO schema_migrations(version,checksum,applied_at) VALUES(2,?,datetime('now'))",
+            [hex::encode(sha2::Sha256::digest(include_str!("../migrations/002_status_completed.sql").as_bytes()))],
         )
         .unwrap();
         let path = std::env::temp_dir().join(format!("termpilot-test-{}.db", uuid::Uuid::new_v4()));

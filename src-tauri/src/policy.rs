@@ -5,12 +5,22 @@ pub fn validate_host(
     port: u16,
     username: &str,
 ) -> Result<(), (&'static str, &'static str)> {
-    if address.is_empty()
-        || address.len() > 253
-        || address.contains(['/', ':', ' ', '\\', '\0', '\n', '\r', '\t'])
-        || address.starts_with('.')
-        || address.ends_with('.')
-    {
+    let is_ipv6 = address
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .or_else(|| address.contains(':').then_some(address))
+        .and_then(|value| value.parse::<std::net::IpAddr>().ok())
+        .is_some_and(|value| value.is_ipv6());
+    let hostname_valid = !address.contains(['/', ' ', '\\', '\0', '\n', '\r', '\t', ':'])
+        && address
+            .split('.')
+            .all(|label| !label.is_empty() && label.len() <= 63)
+        && !address.starts_with('.')
+        && !address.ends_with('.')
+        && address
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '.' | '-'));
+    if address.is_empty() || address.len() > 253 || (!hostname_valid && !is_ipv6) {
         return Err((
             "HOST_INVALID_ADDRESS",
             "地址只能是主机名或 IP，不能包含 URL、路径或 Shell 字符",
@@ -30,9 +40,9 @@ pub fn validate_host(
 pub fn validate_fingerprint(value: &str) -> bool {
     let value = value.strip_prefix("SHA256:").unwrap_or(value);
     (16..=128).contains(&value.len())
-        && value.chars().all(|c| {
-            c.is_ascii_hexdigit() || matches!(c, ':' | '/' | '+' | '=') || c.is_ascii_alphanumeric()
-        })
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '+' | '='))
 }
 pub fn is_fixed_readonly(argv: &[String]) -> bool {
     matches!(argv, [p, a] if (p == "df" && a == "-h"))
@@ -250,5 +260,12 @@ mod tests {
             command_risk(&["bash".into(), "-c".into(), "pwd".into()]),
             "blocked"
         );
+    }
+
+    #[test]
+    fn host_validation_accepts_ipv6_but_rejects_urls() {
+        assert!(validate_host("[2001:db8::1]", 22, "ops").is_ok());
+        assert!(validate_host("2001:db8::1", 22, "ops").is_ok());
+        assert!(validate_host("https://example.test", 22, "ops").is_err());
     }
 }

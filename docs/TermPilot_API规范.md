@@ -75,6 +75,10 @@ ID 使用 UUID/ULID；时间使用 UTC RFC3339；长任务返回任务 ID；所�
 
 请求 `{session_id,path:"~",limit?:number,cursor?}`。连接后默认路径为远端用户 `~`；不允许 NUL、`..` 越界或符号链接逃逸。
 
+响应 `data` 为 `{path,entries,next_cursor,count}`；`entries` 中每项为
+`{name,kind}`，其中 `kind` 为 `file|directory`。目录列表授权事件必须先于
+实际 SFTP 请求落盘，返回内容不包含文件正文。
+
 ### `sftp_transfer_start`
 
 请求 `{session_id,op,src?,dst?,overwrite?:boolean,resume?:boolean}`。`op` 为 `upload|download|delete|rename|mkdir`；单文件上限 20 GiB；本地路径必须由用户按次选择并通过路径校验。生产文件覆盖、删除和上传默认需要人工确认。
