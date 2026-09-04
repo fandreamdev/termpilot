@@ -69,6 +69,29 @@ const mockSettings: Record<string, string> = {
 };
 const mockTransfers = new Map<string, { status: string; progress: number }>();
 const mockListeners = new Map<string, Set<(payload: unknown) => void>>();
+let mockEmergencyStopped = false;
+const mockEmergencyBlocked = new Set([
+  "session_connect",
+  "session_send_input",
+  "session_resize",
+  "sftp_list",
+  "sftp_transfer_start",
+  "list_remote_directory",
+  "read_remote_file",
+  "upload_file",
+  "download_file",
+  "transfer_pause",
+  "transfer_resume",
+  "transfer_cancel",
+  "transfer_retry",
+  "get_terminal_context",
+  "run_read_only_command",
+  "propose_command",
+  "execute_approved_command",
+  "agent_message_send",
+  "agent_cancel",
+  "approval_decide",
+]);
 let cachedPolicyVersion = 1;
 const mockEnvelope = <T>(data: T): Envelope<T> => ({
   ok: true,
@@ -76,12 +99,21 @@ const mockEnvelope = <T>(data: T): Envelope<T> => ({
   data,
   error: null,
 });
+const mockError = <T>(code: string, message: string): Envelope<T> => ({
+  ok: false,
+  request_id: crypto.randomUUID(),
+  data: null,
+  error: { code, message },
+});
 const emitMock = (event: string, payload: unknown) =>
   mockListeners.get(event)?.forEach((handler) => handler(payload));
 const mockCall = async <T>(
   command: string,
   request: MockPayload,
 ): Promise<Envelope<T>> => {
+  if (mockEmergencyStopped && mockEmergencyBlocked.has(command)) {
+    return mockError("EMERGENCY_STOP_ACTIVE", "急停状态已启用");
+  }
   const sessionId = String(request.session_id ?? mockSession?.id ?? "");
   switch (command) {
     case "host_list":
@@ -337,8 +369,16 @@ const mockCall = async <T>(
     case "database_restore":
       return mockEnvelope({ restored: true } as T);
     case "emergency_stop":
+      mockEmergencyStopped = true;
+      mockSession = undefined;
+      emitMock("system.emergency_stop", {
+        event: "system.emergency_stop",
+        version: 1,
+        data: { scope: "all", reason: request.reason },
+      });
       return mockEnvelope(true as T);
     case "emergency_stop_clear":
+      mockEmergencyStopped = false;
       return mockEnvelope(true as T);
     default:
       return mockEnvelope({} as T);
