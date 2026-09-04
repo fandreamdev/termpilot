@@ -1298,6 +1298,7 @@ function Terminal({
   const [approvals, setApprovals] = useState<
     Array<{ id: string; risk: string }>
   >([]);
+  const [activeTaskId, setActiveTaskId] = useState<string>();
   const agentBodyRef = useRef<HTMLDivElement>(null);
   const shellRef = useRef<HTMLDivElement>(null);
   const currentHost = hosts.find((h) => h.id === session?.host_id) ?? hosts[0];
@@ -1328,10 +1329,29 @@ function Terminal({
           ]);
       },
     );
+    const agentListener = api.on<{
+      session_id?: string;
+      data?: { task_id?: string; status?: string; delta?: string };
+    }>("agent.delta", async (payload) => {
+      if (payload.session_id && payload.session_id !== session?.id) return;
+      const delta = payload.data?.delta;
+      if (!delta) return;
+      setActiveTaskId(undefined);
+      setMessages((items) => [...items, delta]);
+      const toolCall = parseAgentToolCall(delta);
+      if (!toolCall || !session) return;
+      setMessages((items) => [...items, `正在调用工具：${toolCall.tool}`]);
+      const toolResult = await api.agentToolDispatch(toolCall, session.id);
+      const resultText = toolResult.ok
+        ? (JSON.stringify(toolResult.data) ?? "工具已完成")
+        : (toolResult.error?.message ?? "工具调用失败");
+      setMessages((items) => [...items, `${toolCall.tool}：${resultText}`]);
+    });
     return () => {
       void listener.then((unlisten) => unlisten());
+      void agentListener.then((unlisten) => unlisten());
     };
-  }, []);
+  }, [session?.id]);
   const startResize = (event: React.PointerEvent<HTMLDivElement>) => {
     event.currentTarget.setPointerCapture(event.pointerId);
     const move = (ev: PointerEvent) => {
@@ -1381,11 +1401,27 @@ function Terminal({
       mode,
       client_request_id: crypto.randomUUID(),
     });
-    const data = response.data as { response?: string } | null;
-    const responseText =
-      data?.response ?? response.error?.message ?? "Agent 暂时不可用";
+    const data = response.data as {
+      response?: string;
+      task_id?: string;
+      status?: string;
+    } | null;
+    if (!response.ok) {
+      setMessages((items) => [
+        ...items,
+        response.error?.message ?? "Agent 暂时不可用",
+      ]);
+      return;
+    }
+    const taskId = data?.task_id;
+    if (data?.status === "active" && taskId) {
+      setActiveTaskId(taskId);
+      setMessages((items) => [...items, "Agent 正在处理…"]);
+      return;
+    }
+    const responseText = data?.response ?? "Agent 暂时不可用";
     setMessages((items) => [...items, responseText]);
-    const toolCall = parseAgentToolCall(data?.response ?? "");
+    const toolCall = parseAgentToolCall(responseText);
     if (!toolCall) return;
     if (!session) {
       setMessages((items) => [...items, "工具调用需要先连接远程会话。"]);
@@ -1397,6 +1433,11 @@ function Terminal({
       ? (JSON.stringify(toolResult.data) ?? "工具已完成")
       : (toolResult.error?.message ?? "工具调用失败");
     setMessages((items) => [...items, `${toolCall.tool}：${resultText}`]);
+  };
+  const cancelAgent = async () => {
+    if (!activeTaskId) return;
+    await api.agentCancel(activeTaskId, "用户取消");
+    setMessages((items) => [...items, "已发送 Agent 取消请求。"]);
   };
   const decide = async (id: string, decision: "approve" | "reject") => {
     const response = await api.approvalDecide(id, decision);
@@ -1518,6 +1559,14 @@ function Terminal({
             <aside className="agent-pane">
               <div className="agent-head">
                 <strong>● Agent 助手</strong>
+                {activeTaskId && (
+                  <button
+                    className="btn red"
+                    onClick={() => void cancelAgent()}
+                  >
+                    取消
+                  </button>
+                )}
                 <select
                   value={mode}
                   onChange={(event) => setMode(event.target.value)}

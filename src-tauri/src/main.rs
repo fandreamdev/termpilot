@@ -21,7 +21,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, OnceLock,
+        mpsc, Arc, Mutex, OnceLock,
     },
 };
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -38,7 +38,7 @@ struct AppState {
     // removed when the desktop window closes.
     credential_cache: Mutex<HashMap<String, String>>,
     session_credential_targets: Mutex<HashSet<String>>,
-    agent_cancelled: Mutex<HashSet<String>>,
+    agent_cancelled: Arc<Mutex<HashSet<String>>>,
     _config: config::AppConfig,
     ssh: Arc<dyn SshTransport>,
     sftp: Arc<dyn SftpTransport>,
@@ -84,6 +84,12 @@ fn reject_if_agent_stopped<T: serde::Serialize>(state: &AppState) -> Option<Enve
     } else {
         None
     }
+}
+fn is_agent_cancelled(cancelled: &Mutex<HashSet<String>>, task_id: &str) -> bool {
+    cancelled
+        .lock()
+        .map(|items| items.contains(task_id))
+        .unwrap_or(true)
 }
 fn next_event_seq(state: &AppState, session_id: &str, stream: &str) -> u64 {
     let Ok(mut sequences) = state.event_seq.lock() else {
@@ -2351,23 +2357,82 @@ fn agent_message_send(
     // Do not hold the SQLite mutex while waiting on a model/network request;
     // other sessions must remain usable and emergency-stop must be responsive.
     drop(conn);
-    let (response, model_status) = match state.model.complete(&system_prompt, &text) {
-        Ok(value) => {
-            let cancelled = state
-                .agent_cancelled
-                .lock()
-                .map(|items| items.contains(&task_id))
-                .unwrap_or(true);
-            if cancelled {
-                ("Agent 任务已取消。".to_owned(), "cancelled")
-            } else {
-                (value, "completed")
+    let app_for_task = app.clone();
+    let db_for_task = state.db.clone();
+    let event_seq_for_task = state.event_seq.clone();
+    let model_for_task = state.model.clone();
+    let cancelled_for_task = state.agent_cancelled.clone();
+    let task_id_for_task = task_id.clone();
+    let session_for_task = session_id.clone();
+    let conversation_for_task = conversation_id.clone();
+    let mode_for_task = mode.clone();
+    std::thread::spawn(move || {
+        run_agent_task(
+            app_for_task,
+            db_for_task,
+            event_seq_for_task,
+            model_for_task,
+            cancelled_for_task,
+            task_id_for_task,
+            session_for_task,
+            conversation_for_task,
+            mode_for_task,
+            system_prompt,
+            text,
+        );
+    });
+    Envelope::ok(
+        json!({"status":"active","mode":mode,"session_id":session_id,"task_id":task_id,"conversation_id":conversation_id}),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_agent_task(
+    app: AppHandle,
+    db: Arc<Mutex<rusqlite::Connection>>,
+    event_seq: Arc<Mutex<HashMap<(String, String), u64>>>,
+    model: Arc<dyn ModelClient>,
+    cancelled: Arc<Mutex<HashSet<String>>>,
+    task_id: String,
+    session_id: String,
+    conversation_id: String,
+    mode: String,
+    system_prompt: String,
+    text: String,
+) {
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let model_for_request = model.clone();
+    std::thread::spawn(move || {
+        let _ = result_tx.send(model_for_request.complete(&system_prompt, &text));
+    });
+    let model_result = loop {
+        if is_agent_cancelled(&cancelled, &task_id) {
+            model.cancel(&task_id);
+            break Err(model_client::ModelError::Cancelled);
+        }
+        match result_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(result) => break result,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                break Err(model_client::ModelError::Unavailable)
             }
         }
+    };
+    let (response, model_status) = match model_result {
+        Ok(_value) if is_agent_cancelled(&cancelled, &task_id) => {
+            ("Agent 任务已取消。".to_owned(), "cancelled")
+        }
+        Ok(value) => (value, "completed"),
+        Err(model_client::ModelError::Cancelled) => ("Agent 任务已取消。".to_owned(), "cancelled"),
         Err(_) => ("模型暂不可用，请使用终端手动操作。".to_owned(), "error"),
     };
     let response = policy::redact_sensitive(&response);
-    let conn = state.db.lock().unwrap();
+    let Ok(conn) = db.lock() else {
+        if let Ok(mut items) = cancelled.lock() {
+            items.remove(&task_id);
+        }
+        return;
+    };
     let _ = conn.execute(
         "INSERT INTO agent_messages(conversation_id,role,content,created_at) VALUES(?,?,?,?)",
         rusqlite::params![
@@ -2399,18 +2464,16 @@ fn agent_message_send(
         Some(&session_id),
         &json!({"task_id":task_id,"conversation_id":conversation_id,"mode":mode}),
     );
-    let seq = next_event_seq(&state, &session_id, "agent");
-    let _ = app.emit("agent.delta", json!({"event":"agent.delta","version":1,"seq":seq,"session_id":session_id,"correlation_id":task_id,"occurred_at":Utc::now().to_rfc3339(),"data":{"task_id":task_id,"status":model_status,"delta":response}}));
-    if let Ok(mut cancelled) = state.agent_cancelled.lock() {
-        cancelled.remove(&task_id);
+    let seq = next_seq_for(&event_seq, &session_id, "agent");
+    let _ = app.emit(
+        "agent.delta",
+        json!({"event":"agent.delta","version":1,"seq":seq,"session_id":session_id,"correlation_id":task_id,"occurred_at":Utc::now().to_rfc3339(),"data":{"task_id":task_id,"status":model_status,"delta":response}}),
+    );
+    if let Ok(mut items) = cancelled.lock() {
+        items.remove(&task_id);
     }
-    if model_status == "error" {
-        return err("MODEL_UNAVAILABLE", "模型暂不可用，请使用终端手动操作");
-    }
-    Envelope::ok(
-        json!({"status":model_status,"message":text,"response":response,"mode":mode,"session_id":session_id,"task_id":task_id,"conversation_id":conversation_id}),
-    )
 }
+
 #[tauri::command]
 fn agent_cancel(state: State<'_, AppState>, request: Value) -> Envelope<Value> {
     let Some(id) = val_str(&request, "task_id") else {
@@ -2891,7 +2954,7 @@ fn main() {
             event_seq: Arc::new(Mutex::new(HashMap::new())),
             credential_cache: Mutex::new(HashMap::new()),
             session_credential_targets: Mutex::new(HashSet::new()),
-            agent_cancelled: Mutex::new(HashSet::new()),
+            agent_cancelled: Arc::new(Mutex::new(HashSet::new())),
             _config: app_config,
             ssh,
             sftp,

@@ -117,7 +117,7 @@ ID 使用 UUID/ULID；时间使用 UTC RFC3339；长任务返回任务 ID；所�
 
 ### `agent_message_send`
 
-请求 `{session_id,text,mode?,client_request_id}`。模式为 `readonly|ask_before_execute|allow_safe_commands|manual_only`，默认 `ask_before_execute`。模型需要工具时只返回一个 `{tool,arguments}` JSON 对象；桌面端仅接受本文定义的 8 个工具并重新生成 `request_id`、`policy_version` 和 `deadline`，不会信任模型携带的元数据或破坏性确认字段。最终执行仍由 Rust 策略、审批、路径校验和急停状态裁决。
+请求 `{session_id,text,mode?,client_request_id}`，立即返回 `{task_id,status:"active",conversation_id}`；最终回答通过 `agent.delta` 事件返回。模式为 `readonly|ask_before_execute|allow_safe_commands|manual_only`，默认 `ask_before_execute`。模型需要工具时只返回一个 `{tool,arguments}` JSON 对象；桌面端仅接受本文定义的 8 个工具并重新生成 `request_id`、`policy_version` 和 `deadline`，不会信任模型携带的元数据或破坏性确认字段。最终执行仍由 Rust 策略、审批、路径校验和急停状态裁决。
 
 ### `agent_cancel`
 
