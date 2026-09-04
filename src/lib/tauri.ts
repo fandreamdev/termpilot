@@ -19,7 +19,7 @@ export const api = {
     if (mock) return [{ id: 'h-prod', name: 'prod-api-01', connection_type: 'direct_ssh', address: '10.0.10.21', port: 22, username: 'ops', auth_method: 'ssh_agent', group_name: '生产', is_production: true }, { id: 'h-test', name: 'test-api-02', connection_type: 'direct_ssh', address: '10.0.20.12', port: 22, username: 'tester', auth_method: 'private_key', group_name: '测试', is_production: false }];
     return (await call<Host[]>('host_list', { page_size: 200 })).data ?? [];
   },
-  connect: async (host_id: string, fingerprint_confirmation: string | boolean = true): Promise<Session> => {
+  connect: async (host_id: string, fingerprint_confirmation?: string | boolean): Promise<Session> => {
     if (mock) return { id: crypto.randomUUID(), host_id, status: 'ready', started_at: new Date().toISOString() };
     const response = await call<Session>('session_connect', { host_id, fingerprint_confirmation, pty: { rows: 30, cols: 120 } });
     if (!response.ok || !response.data) throw new Error(response.error?.message ?? '连接失败');
@@ -44,10 +44,10 @@ export const api = {
   transferRetry: (transfer_id: string, confirmed = false) => call('transfer_retry', { transfer_id, confirmed }),
   policyGet: () => call('policy_get'),
   policyAllowRuleUpsert: (request: unknown) => call('policy_allow_rule_upsert', request),
-  getTerminalContext: (session_id: string) => call('get_terminal_context', { session_id }),
+  getTerminalContext: (session_id: string, policy_version = 1) => call('get_terminal_context', toolRequest({ session_id, policy_version })),
   runReadOnlyCommand: (request: Record<string, unknown>) => call('run_read_only_command', toolRequest(request)),
   proposeCommand: (request: Record<string, unknown>) => call('propose_command', toolRequest(request)),
-  executeApprovedCommand: (approval_id: string, policy_version = 1) => call('execute_approved_command', toolRequest({ approval_id, policy_version })),
+  executeApprovedCommand: (approval_id: string, session_id: string, policy_version = 1) => call('execute_approved_command', toolRequest({ approval_id, session_id, policy_version })),
   agentMessageSend: (request: unknown) => call('agent_message_send', request),
   agentCancel: (task_id: string, reason?: string) => call('agent_cancel', { task_id, reason }),
   approvalDecide: (approval_id: string, decision: 'approve' | 'reject', phrase?: string) => call('approval_decide', { approval_id, decision, phrase }),

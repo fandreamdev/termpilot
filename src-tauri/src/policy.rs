@@ -5,7 +5,12 @@ pub fn validate_host(
     port: u16,
     username: &str,
 ) -> Result<(), (&'static str, &'static str)> {
-    if address.is_empty() || address.contains(['/', ':', ' ']) {
+    if address.is_empty()
+        || address.len() > 253
+        || address.contains(['/', ':', ' ', '\\', '\0', '\n', '\r', '\t'])
+        || address.starts_with('.')
+        || address.ends_with('.')
+    {
         return Err((
             "HOST_INVALID_ADDRESS",
             "地址只能是主机名或 IP，不能包含 URL、路径或 Shell 字符",
@@ -14,7 +19,10 @@ pub fn validate_host(
     if port == 0 {
         return Err(("VALIDATION", "端口必须在 1-65535 范围内"));
     }
-    if username.is_empty() || username.contains([' ', '\\', '/']) {
+    if username.is_empty()
+        || username.len() > 128
+        || username.contains([' ', '\\', '/', '\0', '\n', '\r', '\t'])
+    {
         return Err(("VALIDATION", "用户名格式无效"));
     }
     Ok(())
@@ -22,9 +30,9 @@ pub fn validate_host(
 pub fn validate_fingerprint(value: &str) -> bool {
     let value = value.strip_prefix("SHA256:").unwrap_or(value);
     (16..=128).contains(&value.len())
-        && value
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '/')
+        && value.chars().all(|c| {
+            c.is_ascii_hexdigit() || matches!(c, ':' | '/' | '+' | '=') || c.is_ascii_alphanumeric()
+        })
 }
 pub fn is_fixed_readonly(argv: &[String]) -> bool {
     matches!(argv, [p, a] if (p == "df" && a == "-h"))
@@ -74,6 +82,7 @@ pub fn validate_structured_command(value: &Value) -> bool {
         && program.len() <= 256
         && !is_forbidden_program(program)
         && args.len() <= 64
+        && !contains_secret_argument(args)
         && args.iter().all(|arg| {
             arg.as_str()
                 .map(|s| !s.is_empty() && s.len() <= 4096 && !contains_shell_metacharacters(s))
@@ -81,10 +90,36 @@ pub fn validate_structured_command(value: &Value) -> bool {
         })
 }
 
+fn contains_secret_argument(args: &[Value]) -> bool {
+    args.iter().enumerate().any(|(index, value)| {
+        let Some(text) = value.as_str() else {
+            return true;
+        };
+        let lower = text.to_ascii_lowercase();
+        let key = lower.trim_start_matches('-');
+        let looks_like_key = ["password", "passwd", "token", "secret", "api_key", "apikey"]
+            .iter()
+            .any(|name| key == *name || key.starts_with(&format!("{name}=")));
+        looks_like_key
+            || (index > 0
+                && args[index - 1]
+                    .as_str()
+                    .map(|previous| {
+                        ["password", "passwd", "token", "secret", "api_key", "apikey"]
+                            .iter()
+                            .any(|name| previous.trim_start_matches('-').eq_ignore_ascii_case(name))
+                    })
+                    .unwrap_or(false))
+    })
+}
+
 fn contains_shell_metacharacters(value: &str) -> bool {
-    value
-        .chars()
-        .any(|c| matches!(c, '\0' | '\n' | '\r' | '|' | ';' | '&' | '>' | '<' | '`'))
+    value.chars().any(|c| {
+        matches!(
+            c,
+            '\0' | '\n' | '\r' | '|' | ';' | '&' | '>' | '<' | '`' | '$' | '(' | ')' | '{' | '}'
+        )
+    })
 }
 
 pub fn is_forbidden_program(program: &str) -> bool {
@@ -112,6 +147,30 @@ pub fn command_risk(argv: &[String]) -> &'static str {
     }
     if is_fixed_readonly(argv) {
         "low"
+    } else if argv.first().is_some_and(|program| program == "rm")
+        && argv
+            .iter()
+            .any(|arg| arg == "-rf" || arg == "-fr" || arg == "/")
+    {
+        "blocked"
+    } else if argv.first().is_some_and(|program| {
+        matches!(
+            program.as_str(),
+            "rm" | "rmdir"
+                | "mkfs"
+                | "dd"
+                | "shutdown"
+                | "reboot"
+                | "poweroff"
+                | "halt"
+                | "chmod"
+                | "chown"
+                | "iptables"
+                | "nft"
+                | "systemctl"
+        )
+    }) {
+        "high"
     } else {
         "medium"
     }
@@ -180,9 +239,12 @@ mod tests {
         assert!(!validate_structured_command(
             &serde_json::json!({"program":"sh","args":["-c","pwd"]})
         ));
+        assert!(!validate_structured_command(
+            &serde_json::json!({"program":"tool","args":["--token","secret-value"]})
+        ));
         assert_eq!(
             command_risk(&["rm".into(), "-rf".into(), "/".into()]),
-            "medium"
+            "blocked"
         );
         assert_eq!(
             command_risk(&["bash".into(), "-c".into(), "pwd".into()]),

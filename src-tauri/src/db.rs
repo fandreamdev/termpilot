@@ -173,6 +173,13 @@ pub fn update_session_observed(
 pub fn has_active_session(c: &Connection, host_id: &str) -> rusqlite::Result<bool> {
     c.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE host_id=? AND status IN('connecting','ready','reconnecting'))",[host_id],|r|r.get(0))
 }
+pub fn active_session_count(c: &Connection) -> rusqlite::Result<i64> {
+    c.query_row(
+        "SELECT COUNT(*) FROM sessions WHERE status IN('connecting','ready','reconnecting')",
+        [],
+        |r| r.get(0),
+    )
+}
 pub fn session_host_is_production(c: &Connection, session_id: &str) -> rusqlite::Result<bool> {
     c.query_row("SELECT COALESCE(h.is_production,0) FROM sessions s JOIN hosts h ON h.id=s.host_id WHERE s.id=?", [session_id], |r| Ok(r.get::<_, i64>(0)? != 0))
 }
@@ -281,6 +288,9 @@ pub fn set_setting(
     value: &str,
     value_type: &str,
 ) -> rusqlite::Result<()> {
+    if !matches!(value_type, "string" | "integer" | "boolean" | "json") {
+        return Err(rusqlite::Error::InvalidParameterName("setting type".into()));
+    }
     let lower = key.to_ascii_lowercase();
     if [
         "password",
@@ -305,11 +315,51 @@ pub fn set_setting(
     {
         return Err(rusqlite::Error::InvalidParameterName("secret value".into()));
     }
+    if value_type == "json" {
+        if let Ok(parsed) = serde_json::from_str::<Value>(value) {
+            if json_contains_secret_key(&parsed) {
+                return Err(rusqlite::Error::InvalidParameterName("secret json".into()));
+            }
+        }
+    }
     if key.is_empty() || key.len() > 128 || value.len() > 16 * 1024 {
         return Err(rusqlite::Error::InvalidParameterName("setting".into()));
     }
+    match value_type {
+        "integer" if value.parse::<i64>().is_err() => {
+            return Err(rusqlite::Error::InvalidParameterName("integer".into()))
+        }
+        "boolean" if !matches!(value, "true" | "false") => {
+            return Err(rusqlite::Error::InvalidParameterName("boolean".into()))
+        }
+        "json" if serde_json::from_str::<Value>(value).is_err() => {
+            return Err(rusqlite::Error::InvalidParameterName("json".into()))
+        }
+        _ => {}
+    }
     c.execute("INSERT INTO app_settings(key,value,value_type,updated_at) VALUES(?,?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,value_type=excluded.value_type,updated_at=excluded.updated_at", params![key,value,value_type,Utc::now().to_rfc3339()])?;
     Ok(())
+}
+
+fn json_contains_secret_key(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map.iter().any(|(key, child)| {
+            let key = key.to_ascii_lowercase();
+            [
+                "password",
+                "passwd",
+                "token",
+                "secret",
+                "private_key",
+                "api_key",
+            ]
+            .iter()
+            .any(|needle| key.contains(needle))
+                || json_contains_secret_key(child)
+        }),
+        Value::Array(values) => values.iter().any(json_contains_secret_key),
+        _ => false,
+    }
 }
 pub fn get_settings(c: &Connection) -> rusqlite::Result<Vec<(String, String, String, String)>> {
     let mut s =
@@ -330,6 +380,51 @@ pub fn backup(c: &Connection, path: &Path) -> rusqlite::Result<()> {
         "PRAGMA wal_checkpoint(TRUNCATE); VACUUM INTO '{}';",
         escaped
     ))
+}
+
+/// Validate a backup before replacing any live tables. A backup is accepted
+/// only when it is a readable SQLite database containing the current schema
+/// tables; this prevents accidentally importing an arbitrary `.db` file and
+/// leaving the application in a partially restored state.
+pub fn validate_backup(path: &Path) -> rusqlite::Result<()> {
+    let backup = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    let required = [
+        "schema_migrations",
+        "app_settings",
+        "security_policies",
+        "hosts",
+        "credential_refs",
+        "sessions",
+        "agent_conversations",
+        "agent_messages",
+        "command_approvals",
+        "execution_records",
+        "sftp_operations",
+        "audit_logs",
+        "audit_exports",
+    ];
+    for table in required {
+        let exists: bool = backup.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?)",
+            [table],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+    }
+    let migration_version: i64 = backup.query_row(
+        "SELECT COALESCE(MAX(version),0) FROM schema_migrations",
+        [],
+        |r| r.get(0),
+    )?;
+    if migration_version < 2 {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -369,5 +464,36 @@ mod tests {
             .unwrap(),
             first
         );
+    }
+
+    #[test]
+    fn backup_validation_rejects_arbitrary_sqlite_files() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(include_str!("../migrations/001_init.sql"))
+            .unwrap();
+        c.execute_batch(include_str!("../migrations/002_status_completed.sql"))
+            .unwrap();
+        c.execute(
+            "INSERT INTO schema_migrations(version,checksum,applied_at) VALUES(2,'test',datetime('now'))",
+            [],
+        )
+        .unwrap();
+        let path = std::env::temp_dir().join(format!("termpilot-test-{}.db", uuid::Uuid::new_v4()));
+        backup(&c, &path).unwrap();
+        assert!(validate_backup(&path).is_ok());
+        let bad = path.with_file_name(format!("{}.bad.db", uuid::Uuid::new_v4()));
+        Connection::open(&bad).unwrap();
+        assert!(validate_backup(&bad).is_err());
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(bad);
+    }
+
+    #[test]
+    fn settings_reject_secret_json() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(include_str!("../migrations/001_init.sql"))
+            .unwrap();
+        assert!(set_setting(&c, "model", r#"{"token":"abc"}"#, "json").is_err());
+        assert!(set_setting(&c, "model", r#"{"provider":"ollama"}"#, "json").is_ok());
     }
 }
