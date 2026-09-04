@@ -9,7 +9,7 @@ const call = async <T>(command: string, request: unknown = {}): Promise<Envelope
 
 export const api = {
   hosts: async (): Promise<Host[]> => {
-    if (mock) return [{ id: 'h-prod', name: 'prod-api-01', connection_type: 'direct_ssh', address: '10.0.10.21', port: 22, username: 'ops', auth_method: 'ssh_agent', group_name: '生产', is_production: true, workspace_root: '/srv/work' }, { id: 'h-test', name: 'test-api-02', connection_type: 'direct_ssh', address: '10.0.20.12', port: 22, username: 'tester', auth_method: 'private_key', group_name: '测试', is_production: false, workspace_root: '/srv/work' }];
+    if (mock) return [{ id: 'h-prod', name: 'prod-api-01', connection_type: 'direct_ssh', address: '10.0.10.21', port: 22, username: 'ops', auth_method: 'ssh_agent', group_name: '生产', is_production: true }, { id: 'h-test', name: 'test-api-02', connection_type: 'direct_ssh', address: '10.0.20.12', port: 22, username: 'tester', auth_method: 'private_key', group_name: '测试', is_production: false }];
     return (await call<Host[]>('host_list', { page_size: 200 })).data ?? [];
   },
   connect: async (host_id: string): Promise<Session> => {

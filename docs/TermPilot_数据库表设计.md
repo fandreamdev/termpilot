@@ -28,7 +28,7 @@ CREATE TABLE schema_migrations(
 
 ### `app_settings`
 
-保存主题、快捷键、默认 workspace、审计保留天数和单一模型配置路径等非秘密设置。禁止保存密码、Token 或 API Key。
+保存主题、快捷键、审计保留天数和单一模型配置路径等非秘密设置。远端文件浏览默认从用户主目录 `~` 开始，不保存全局 workspace。禁止保存密码、Token 或 API Key。
 
 ```sql
 CREATE TABLE app_settings(
@@ -72,7 +72,6 @@ CREATE TABLE hosts(
   auth_method TEXT NOT NULL CHECK(auth_method IN('password','private_key','ssh_agent')),
   group_name TEXT,
   is_production INTEGER NOT NULL DEFAULT 0 CHECK(is_production IN(0,1)),
-  workspace_root TEXT,
   endpoint_fingerprint TEXT,
   remote_identity_hmac TEXT,
   policy_id TEXT NOT NULL,

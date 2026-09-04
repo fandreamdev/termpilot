@@ -14,8 +14,8 @@ TermPilot 仅供本人在当前 Windows x64 电脑上使用，用于本人已获
 - 直连 SSH 和单级 SSH 堡垒机。
 - 密码、私钥文件引用、SSH Agent。
 - xterm.js 远程 SSH PTY、输入、输出、resize、断线提示。
-- SFTP 列表、上传、下载、删除、重命名、新目录、暂停、取消、重试和下载续传。
-- 本地 workspace 限制、远端路径校验、符号链接复核和覆盖确认。
+- SFTP 列表、上传、下载、删除、重命名、新目录、暂停、取消、重试和下载续传；连接后默认访问远端 `~`。
+- 本地路径按次选择并校验，远端执行 realpath、符号链接复核和覆盖确认。
 - SQLite 本地审计和 JSONL 导出；SHA-256 哈希链校验。
 - 默认人工审批、固定只读命令白名单、高危命令阻断。
 - 超时、取消和全局急停。
@@ -50,7 +50,7 @@ Credential Manager 引用、密码会话缓存、私钥路径、SSH Agent、主�
 
 ### P2：终端和 SFTP（第 3–5 周）
 
-远程 PTY、resize、输出限流、SFTP 基础操作、workspace/realpath 校验、下载续传和原子替换。
+远程 PTY、resize、输出限流、SFTP 基础操作、远端 `~`/realpath 校验、下载续传和原子替换。
 
 退出条件：localhost/隔离服务器完成终端和文件操作；强制断开后资源释放。
 

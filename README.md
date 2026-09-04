@@ -20,7 +20,7 @@ cargo check --manifest-path src-tauri/Cargo.toml
 npm run tauri:dev # Windows Tauri 桌面应用
 ```
 
-开发环境默认使用前端 Mock 数据；在 Tauri 窗口内会调用 Rust commands。真实 SSH、SFTP、Credential Manager 和唯一模型 Provider 通过适配器接入，未完成外部确认前不会自动连接正式服务器。
+开发环境默认使用前端 Mock 数据；在 Tauri 窗口内会调用 Rust commands。远程文件浏览连接后默认从用户主目录 `~` 开始，本地上传下载路径按次选择并校验。真实 SSH、SFTP、Credential Manager 和唯一模型 Provider 通过适配器接入，未完成外部确认前不会自动连接正式服务器。
 
 ## 安全边界
 

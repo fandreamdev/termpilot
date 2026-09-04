@@ -32,7 +32,7 @@ ID 使用 UUID/ULID；时间使用 UTC RFC3339；长任务返回任务 ID；所�
 {"id?":"h1","name":"测试机","connection_type":"direct_ssh",
  "address":"192.168.1.10","port":22,"username":"ops",
  "auth_method":"password","group_name":"test","is_production":false,
- "workspace_root":"/srv/work","policy_id":"p1"}
+ "policy_id":"p1"}
 ```
 
 `connection_type` 为 `direct_ssh|bastion_endpoint`；地址不得含 URL、路径或 Shell 字符；端口 1–65535；名称同一用户唯一。生产标记不会因编辑连接参数自动清除。
@@ -73,11 +73,11 @@ ID 使用 UUID/ULID；时间使用 UTC RFC3339；长任务返回任务 ID；所�
 
 ### `sftp_list`
 
-请求 `{session_id,path,limit?:number,cursor?}`。路径必须位于远端 workspace 根目录；不允许 NUL、`..` 越界或符号链接逃逸。
+请求 `{session_id,path:"~",limit?:number,cursor?}`。连接后默认路径为远端用户 `~`；不允许 NUL、`..` 越界或符号链接逃逸。
 
 ### `sftp_transfer_start`
 
-请求 `{session_id,op,src?,dst?,overwrite?:boolean,resume?:boolean}`。`op` 为 `upload|download|delete|rename|mkdir`；单文件上限 20 GiB；本地路径必须位于批准的 workspace。生产文件覆盖、删除和上传默认需要人工确认。
+请求 `{session_id,op,src?,dst?,overwrite?:boolean,resume?:boolean}`。`op` 为 `upload|download|delete|rename|mkdir`；单文件上限 20 GiB；本地路径必须由用户按次选择并通过路径校验。生产文件覆盖、删除和上传默认需要人工确认。
 
 返回 `{transfer_id,status:"queued"}`。`transfer_id` 与数据库 `sftp_operations.id` 相同。
 

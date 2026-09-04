@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Host { pub id: String, pub name: String, pub connection_type: String, pub address: String, pub port: u16, pub username: String, pub auth_method: String, pub group_name: Option<String>, pub is_production: bool, pub workspace_root: Option<String>, pub endpoint_fingerprint: Option<String> }
+pub struct Host { pub id: String, pub name: String, pub connection_type: String, pub address: String, pub port: u16, pub username: String, pub auth_method: String, pub group_name: Option<String>, pub is_production: bool, pub endpoint_fingerprint: Option<String> }
 #[derive(Debug, Deserialize)]
-pub struct HostUpsert { pub id: Option<String>, pub name: String, pub connection_type: String, pub address: String, pub port: u16, pub username: String, pub auth_method: String, pub group_name: Option<String>, pub is_production: bool, pub workspace_root: Option<String>, pub policy_id: String }
+pub struct HostUpsert { pub id: Option<String>, pub name: String, pub connection_type: String, pub address: String, pub port: u16, pub username: String, pub auth_method: String, pub group_name: Option<String>, pub is_production: bool, pub policy_id: String }
 #[derive(Debug, Serialize)]
 pub struct Session { pub id: String, pub host_id: String, pub status: String, pub started_at: String }
 #[derive(Debug, Serialize)]
