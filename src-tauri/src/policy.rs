@@ -69,6 +69,12 @@ pub fn redact_sensitive(input: &str) -> String {
                 "private key",
                 "api_key",
                 "api-key",
+                "apikey",
+                "access_key",
+                "access-key",
+                "accesskey",
+                "client_secret",
+                "client-secret",
                 "access_token",
                 "access-token",
                 "authorization: bearer",
@@ -295,6 +301,8 @@ mod tests {
             redact_sensitive("Authorization: Bearer hidden"),
             "[REDACTED]"
         );
+        assert_eq!(redact_sensitive("APIKEY=hidden"), "[REDACTED]");
+        assert_eq!(redact_sensitive("AWS_ACCESS_KEY=hidden"), "[REDACTED]");
     }
 
     #[test]
