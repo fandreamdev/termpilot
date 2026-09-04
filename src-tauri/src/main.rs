@@ -348,12 +348,14 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
     if value.len() <= max_bytes {
         return value.to_owned();
     }
-    let end = value
-        .char_indices()
-        .take_while(|(index, _)| *index < max_bytes)
-        .map(|(index, _)| index)
-        .last()
-        .unwrap_or(0);
+    let mut end = 0;
+    for (index, character) in value.char_indices() {
+        let next = index + character.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
     value[..end].to_owned()
 }
 
@@ -3447,6 +3449,8 @@ mod app_tests {
 
     #[test]
     fn emitted_agent_text_is_bounded_on_utf8_boundaries() {
+        assert_eq!(truncate_utf8("abcdef", 1), "a");
+        assert_eq!(truncate_utf8("abcdef", 3), "abc");
         let text = truncate_utf8(&"中".repeat(30_000), 48 * 1024);
         assert!(text.len() <= 48 * 1024);
         assert_eq!(text.chars().count() * "中".len(), text.len());
