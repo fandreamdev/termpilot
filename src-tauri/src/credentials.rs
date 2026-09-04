@@ -114,3 +114,26 @@ mod platform {
 }
 
 pub use platform::{delete_password, read_password, write_password};
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::{delete_password, read_password, write_password};
+
+    struct TemporaryCredential(String);
+
+    impl Drop for TemporaryCredential {
+        fn drop(&mut self) {
+            let _ = delete_password(&self.0);
+        }
+    }
+
+    #[test]
+    fn session_password_round_trips_through_credential_manager() {
+        let target = TemporaryCredential(format!("TermPilot-test-{}", uuid::Uuid::new_v4()));
+        write_password(&target.0, "test-password-not-a-user-secret").unwrap();
+        assert_eq!(
+            read_password(&target.0).unwrap(),
+            "test-password-not-a-user-secret"
+        );
+    }
+}
