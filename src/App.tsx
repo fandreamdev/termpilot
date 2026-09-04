@@ -9,6 +9,10 @@ import type { Host, Session } from "./types";
 import { Terminal as XTerminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
+import {
+  open as openFileDialog,
+  save as saveFileDialog,
+} from "@tauri-apps/plugin-dialog";
 
 type NavIconName =
   | "dashboard"
@@ -729,16 +733,57 @@ function SftpPage({ session }: { session?: Session }) {
         name,
       );
   };
-  const upload = (file: File) => {
-    const local = (file as File & { path?: string }).path ?? file.name;
+  const uploadPath = (local: string, filename: string) => {
     void start(
       {
         op: "upload",
         src: local,
-        dst: `${path.replace(/\/$/, "")}/${file.name}`,
+        dst: `${path.replace(/\/$/, "")}/${filename}`,
         confirmed: true,
       },
-      file.name,
+      filename,
+    );
+  };
+  const upload = (file: File) => {
+    const local =
+      (file as File & { path?: string }).path ??
+      (import.meta.env.DEV ? file.name : undefined);
+    if (!local) {
+      window.alert("当前环境未提供文件绝对路径，请使用 Tauri 原生文件选择器。");
+      return;
+    }
+    uploadPath(local, file.name);
+  };
+  const chooseUpload = async () => {
+    if ("__TAURI_INTERNALS__" in window) {
+      const selected = await openFileDialog({
+        multiple: false,
+        directory: false,
+      });
+      const local = Array.isArray(selected) ? selected[0] : selected;
+      if (typeof local === "string" && local) {
+        const filename = local.split(/[\\/]/).pop() || local;
+        uploadPath(local, filename);
+      }
+      return;
+    }
+    fileInput.current?.click();
+  };
+  const download = async (filename: string) => {
+    let destination = `${filename}.download`;
+    if ("__TAURI_INTERNALS__" in window) {
+      const selected = await saveFileDialog({ defaultPath: filename });
+      if (!selected) return;
+      destination = selected;
+    }
+    void start(
+      {
+        op: "download",
+        src: `${path.replace(/\/$/, "")}/${filename}`,
+        dst: destination,
+        confirmed: true,
+      },
+      filename,
     );
   };
   const shownFiles = remoteFiles.length ? remoteFiles : fallback;
@@ -759,10 +804,7 @@ function SftpPage({ session }: { session?: Session }) {
           <button className="btn" onClick={createDirectory}>
             ＋ 新目录
           </button>
-          <button
-            className="btn primary"
-            onClick={() => fileInput.current?.click()}
-          >
+          <button className="btn primary" onClick={() => void chooseUpload()}>
             ↑ 上传文件
           </button>
           <input
@@ -830,17 +872,7 @@ function SftpPage({ session }: { session?: Session }) {
                   </button>
                   <button
                     className="btn"
-                    onClick={() =>
-                      void start(
-                        {
-                          op: "download",
-                          src: `${path.replace(/\/$/, "")}/${file.name}`,
-                          dst: `${file.name}.download`,
-                          confirmed: true,
-                        },
-                        file.name,
-                      )
-                    }
+                    onClick={() => void download(file.name)}
                   >
                     下载
                   </button>

@@ -2878,6 +2878,7 @@ fn main() {
         Arc::new(transport::MockSftpTransport::default())
     };
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             install_audit_listener(app.handle().clone());
             Ok(())
