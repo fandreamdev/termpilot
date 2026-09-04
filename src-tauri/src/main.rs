@@ -575,6 +575,10 @@ fn session_connect(
             "密码不可用，请重新输入并在本次应用运行中保存",
         );
     }
+    // Host-key discovery invokes an external process/network and must not hold
+    // the SQLite mutex, otherwise a slow endpoint would block other sessions
+    // and emergency-stop.
+    drop(conn);
     let Some(computed_fingerprint) = state.ssh.fingerprint(&address, port).ok().flatten() else {
         return err("SSH_HOSTKEY_CHANGED", "无法读取远端主机指纹，已阻止连接");
     };
@@ -604,6 +608,22 @@ fn session_connect(
             format!("首次连接必须确认主机指纹：{computed_fingerprint}"),
         );
     }
+    let conn = state.db.lock().unwrap();
+    if !db::host_exists(&conn, &host_id).unwrap_or(false)
+        || db::active_session_count(&conn).unwrap_or(8) >= 8
+    {
+        return err("CONFLICT", "主机已变化或已达到 8 个并发 SSH 会话上限");
+    }
+    let current_endpoint: Result<(String, u16, String, String), _> = conn.query_row(
+        "SELECT address,port,username,auth_method FROM hosts WHERE id=? AND deleted_at IS NULL",
+        [&host_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    );
+    if current_endpoint.ok().as_ref()
+        != Some(&(address.clone(), port, username.clone(), auth_method.clone()))
+    {
+        return err("CONFLICT", "主机连接参数在连接期间发生变化，请重试");
+    }
     if db::append_audit(
         &conn,
         "session.connect",
@@ -618,22 +638,71 @@ fn session_connect(
         return err("AUDIT_UNAVAILABLE", "审计不可用，已阻止连接");
     }
     let id = uuid::Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    if conn
+        .execute(
+            "INSERT INTO sessions(id,host_id,status,observed_endpoint_fingerprint,pty_rows,pty_cols,started_at) VALUES(?,?,?,?,?,?,?)",
+            rusqlite::params![id, host_id, "connecting", computed_fingerprint, rows, cols, now],
+        )
+        .is_err()
+    {
+        return err("INTERNAL", "创建连接记录失败");
+    }
+    // Never hold the SQLite mutex while a network connection is in flight;
+    // other sessions and emergency-stop must remain responsive.
+    drop(conn);
     if state
         .ssh
         .connect_for_session(&id, &address, port, &username, credential_material.as_ref())
         .is_err()
     {
+        if let Ok(conn) = state.db.lock() {
+            let _ = conn.execute(
+                "UPDATE sessions SET status='error',ended_at=?,disconnect_reason=? WHERE id=?",
+                rusqlite::params![Utc::now().to_rfc3339(), "connect_failed", id],
+            );
+            let _ = db::append_audit(
+                &conn,
+                "session.connect.failed",
+                "error",
+                "system",
+                Some(&host_id),
+                Some(&id),
+                &json!({"reason":"transport_unavailable"}),
+            );
+        }
         return err("SSH_TIMEOUT", "SSH 连接失败");
     }
-    let _ = conn.execute(
-        "UPDATE hosts SET endpoint_fingerprint=? WHERE id=?",
-        rusqlite::params![computed_fingerprint, host_id],
-    );
-    let now = Utc::now().to_rfc3339();
-    if conn.execute("INSERT INTO sessions(id,host_id,status,observed_endpoint_fingerprint,pty_rows,pty_cols,started_at) VALUES(?,?,?,?,?,?,?)",rusqlite::params![id,host_id,"ready",computed_fingerprint,rows,cols,now]).is_err(){
+    let conn = state.db.lock().unwrap();
+    if state.emergency_stop.load(Ordering::SeqCst) {
         state.ssh.close(&id);
-        return err("INTERNAL","创建会话失败");
-    };
+        let _ = conn.execute(
+            "UPDATE sessions SET status='closed',ended_at=?,disconnect_reason=? WHERE id=?",
+            rusqlite::params![Utc::now().to_rfc3339(), "emergency_stop", id],
+        );
+        return err("EMERGENCY_STOP_ACTIVE", "急停状态已启用");
+    }
+    let updated = conn
+        .execute(
+            "UPDATE hosts SET endpoint_fingerprint=? WHERE id=?",
+            rusqlite::params![computed_fingerprint, host_id],
+        )
+        .is_ok()
+        && conn
+            .execute(
+                "UPDATE sessions SET status='ready' WHERE id=? AND status='connecting'",
+                [&id],
+            )
+            .map(|count| count == 1)
+            .unwrap_or(false);
+    if !updated {
+        state.ssh.close(&id);
+        let _ = conn.execute(
+            "UPDATE sessions SET status='error',ended_at=?,disconnect_reason=? WHERE id=?",
+            rusqlite::params![Utc::now().to_rfc3339(), "session_record_failed", id],
+        );
+        return err("INTERNAL", "更新会话记录失败");
+    }
     let session = Session {
         id,
         host_id,

@@ -594,29 +594,66 @@ impl OpenSftpTransport {
             stdin.write_all(b"\nquit\n").ok();
         }
         const MAX_BATCH_OUTPUT: usize = 8 * 1024 * 1024;
-        let stdout = child
+        let pid = child.id();
+        let mut stdout = child
             .stdout
             .take()
             .ok_or_else(|| TransportError::Unavailable("sftp stdout unavailable".into()))?;
-        let mut bytes = Vec::with_capacity(64 * 1024);
-        stdout
-            .take((MAX_BATCH_OUTPUT + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(|e| TransportError::Unavailable(e.to_string()))?;
-        if bytes.len() > MAX_BATCH_OUTPUT {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(TransportError::Unavailable(
-                "sftp output limit exceeded".into(),
-            ));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::with_capacity(64 * 1024);
+            let mut buffer = [0u8; 16 * 1024];
+            loop {
+                match stdout.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let remaining = MAX_BATCH_OUTPUT.saturating_sub(bytes.len());
+                        if n > remaining {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            let _ = sender.send(Err(TransportError::Unavailable(
+                                "sftp output limit exceeded".into(),
+                            )));
+                            return;
+                        }
+                        bytes.extend_from_slice(&buffer[..n]);
+                    }
+                    Err(_) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = sender.send(Err(TransportError::Unavailable(
+                            "sftp stdout read failed".into(),
+                        )));
+                        return;
+                    }
+                }
+            }
+            let result = child
+                .wait()
+                .map_err(|e| TransportError::Unavailable(e.to_string()))
+                .and_then(|status| {
+                    if status.success() {
+                        Ok(String::from_utf8_lossy(&bytes).into_owned())
+                    } else {
+                        Err(TransportError::Unavailable("sftp operation failed".into()))
+                    }
+                });
+            let _ = sender.send(result);
+        });
+        match receiver.recv_timeout(std::time::Duration::from_secs(600)) {
+            Ok(result) => result,
+            Err(_) => {
+                #[cfg(windows)]
+                {
+                    let _ = Command::new("taskkill")
+                        .args(["/PID", &pid.to_string(), "/T", "/F"])
+                        .output();
+                }
+                #[cfg(not(windows))]
+                let _ = pid;
+                Err(TransportError::Timeout)
+            }
         }
-        let status = child
-            .wait()
-            .map_err(|e| TransportError::Unavailable(e.to_string()))?;
-        if !status.success() {
-            return Err(TransportError::Unavailable("sftp operation failed".into()));
-        }
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
     fn remote_exists(&self, session_id: &str, path: &str) -> bool {
         self.batch(session_id, &[format!("ls {}", sftp_quote(path))])
