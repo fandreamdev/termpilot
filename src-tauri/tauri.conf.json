@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "TermPilot",
+  "version": "0.1.0",
+  "identifier": "dev.termpilot.personal",
+  "build": { "beforeDevCommand": "npm run dev", "devUrl": "http://localhost:1420", "frontendDist": "../dist" },
+  "app": { "windows": [{ "title": "TermPilot", "width": 1280, "height": 820, "minWidth": 960, "minHeight": 640 }], "security": { "csp": null } },
+  "bundle": { "active": false, "icon": [] }
+}
