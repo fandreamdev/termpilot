@@ -43,7 +43,7 @@ ID 使用 UUID/ULID；时间使用 UTC RFC3339；长任务返回任务 ID；所�
 
 ### `credential_store`
 
-支持 `password|private_key|ssh_agent`。个人版只实现“不保存”和“本次应用运行”两种模式；密码/私钥正文只进入 Credential Manager 或用户选择的私钥文件，不回显。Hello/PIN 和凭据包导入不实现。
+请求为 `{host_id,kind,target_name?,secret?,retention_mode}`，其中 `kind` 为 `password|private_key|ssh_agent`，`retention_mode` 为 `never|app_session`。个人版只实现“不保存”和“本次应用运行”两种模式：`app_session` 密码写入当前 Windows 用户的 Generic Credential，应用主窗口关闭时删除；`never` 密码仅保留在进程内存直到退出。私钥仅保存用户选取的绝对文件路径，SSH Agent 不保存秘密。响应仅返回非秘密的 `credential_ref`、类型和保存模式；密码、私钥正文不会回显，也不会写入 SQLite、日志、审计或模型上下文。Hello/PIN 和凭据包导入不实现。
 
 ## 3. SSH 会话和终端
 

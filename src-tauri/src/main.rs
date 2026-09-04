@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 mod audit;
 mod config;
+mod credentials;
 mod db;
 mod model_client;
 mod models;
@@ -23,7 +24,7 @@ use std::{
         Arc, Mutex,
     },
 };
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use transport::{SftpTransport, SshTransport};
 
 struct AppState {
@@ -32,7 +33,11 @@ struct AppState {
     emergency_agent_stop: AtomicBool,
     stopped_sessions: Mutex<HashSet<String>>,
     event_seq: Arc<Mutex<HashMap<(String, String), u64>>>,
+    // `never` passwords live here only until the current process exits.
+    // Session passwords use Windows Credential Manager; tracked targets are
+    // removed when the desktop window closes.
     credential_cache: Mutex<HashMap<String, String>>,
+    session_credential_targets: Mutex<HashSet<String>>,
     agent_cancelled: Mutex<HashSet<String>>,
     _config: config::AppConfig,
     ssh: Arc<dyn SshTransport>,
@@ -322,15 +327,14 @@ fn credential_store(state: State<'_, AppState>, request: Value) -> Envelope<Valu
         return err("NOT_FOUND", "私钥文件必须是存在的本地绝对路径");
     }
     let id = uuid::Uuid::new_v4().to_string();
-    if let Some(secret) = val_str(&request, "secret") {
-        if kind != "password" || secret.is_empty() || secret.len() > 16 * 1024 {
-            return err("VALIDATION", "凭据正文仅允许短密码且不会被持久化");
-        }
-        if retention == "app_session" {
-            if let Ok(mut cache) = state.credential_cache.lock() {
-                cache.insert(id.clone(), secret);
-            }
-        }
+    let password = val_str(&request, "secret");
+    if password.is_some() && kind != "password" {
+        return err("VALIDATION", "凭据正文仅允许用于密码认证");
+    }
+    if kind == "password"
+        && !matches!(password.as_deref(), Some(value) if !value.is_empty() && value.len() <= 16 * 1024)
+    {
+        return err("VALIDATION", "密码不能为空且不得超过 16 KiB");
     }
     let location = if kind == "private_key" {
         "user_file"
@@ -343,21 +347,43 @@ fn credential_store(state: State<'_, AppState>, request: Value) -> Envelope<Valu
     if !db::credential_host_exists(&conn, &host_id).unwrap_or(false) {
         return err("NOT_FOUND", "主机不存在");
     }
-    let previous_ref: Option<String> = conn
+    let previous_ref: Option<(String, String)> = conn
         .query_row(
-            "SELECT id FROM credential_refs WHERE host_id=? AND kind=?",
+            "SELECT id,target_name FROM credential_refs WHERE host_id=? AND kind=?",
             rusqlite::params![host_id, kind],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .ok();
+    if kind == "password" {
+        let password = password.as_deref().expect("password validated above");
+        if retention == "app_session" {
+            if credentials::write_password(&target, password).is_err() {
+                return err(
+                    "CREDENTIAL_MANAGER_UNAVAILABLE",
+                    "无法写入 Windows Credential Manager",
+                );
+            }
+            if let Ok(mut targets) = state.session_credential_targets.lock() {
+                targets.insert(target.clone());
+            }
+        } else if let Ok(mut cache) = state.credential_cache.lock() {
+            cache.insert(id.clone(), password.to_owned());
+        }
+    }
     let r=conn.execute("INSERT INTO credential_refs(id,host_id,kind,target_name,secret_location,retention_mode,created_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(host_id,kind) DO UPDATE SET id=excluded.id,target_name=excluded.target_name,secret_location=excluded.secret_location,retention_mode=excluded.retention_mode,revoked_at=NULL",rusqlite::params![id,host_id,kind,target,location,retention,Utc::now().to_rfc3339()]);
     if r.is_err() {
         return err("CONFLICT", "凭据引用保存失败");
     };
-    if let Some(previous) = previous_ref {
+    if let Some((previous, previous_target)) = previous_ref {
         if previous != id {
             if let Ok(mut cache) = state.credential_cache.lock() {
                 cache.remove(&previous);
+            }
+            if kind == "password" && previous_target != target {
+                let _ = credentials::delete_password(&previous_target);
+                if let Ok(mut targets) = state.session_credential_targets.lock() {
+                    targets.remove(&previous_target);
+                }
             }
         }
     }
@@ -456,18 +482,34 @@ fn session_connect(
             })
             .map(|path| transport::CredentialMaterial::PrivateKey(PathBuf::from(path))),
         Some("password") => credential.as_ref().and_then(|(ref_id, _)| {
-            state
-                .credential_cache
-                .lock()
-                .ok()
-                .and_then(|cache| cache.get(ref_id).cloned())
+            let record: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT target_name,retention_mode FROM credential_refs WHERE id=? AND revoked_at IS NULL",
+                    [ref_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .ok();
+            record.and_then(|(target, retention)| {
+                if retention == "app_session" {
+                    credentials::read_password(&target).ok()
+                } else {
+                    state
+                        .credential_cache
+                        .lock()
+                        .ok()
+                        .and_then(|cache| cache.get(ref_id).cloned())
+                }
                 .map(transport::CredentialMaterial::Password)
+            })
         }),
         Some("ssh_agent") | None => Some(transport::CredentialMaterial::SshAgent),
         _ => None,
     };
     if auth_method == "password" && credential_material.is_none() {
-        return err("SSH_AUTH_FAILED", "密码未在本次应用会话中提供，请重新输入");
+        return err(
+            "SSH_AUTH_FAILED",
+            "密码不可用，请重新输入并在本次应用运行中保存",
+        );
     }
     let Some(computed_fingerprint) = state.ssh.fingerprint(&address, port).ok().flatten() else {
         return err("SSH_HOSTKEY_CHANGED", "无法读取远端主机指纹，已阻止连接");
@@ -2808,6 +2850,7 @@ fn main() {
             stopped_sessions: Mutex::new(HashSet::new()),
             event_seq: Arc::new(Mutex::new(HashMap::new())),
             credential_cache: Mutex::new(HashMap::new()),
+            session_credential_targets: Mutex::new(HashSet::new()),
             agent_cancelled: Mutex::new(HashSet::new()),
             _config: app_config,
             ssh,
@@ -2853,6 +2896,20 @@ fn main() {
             emergency_stop,
             emergency_stop_clear
         ])
+        .on_window_event(|window, event| {
+            if !matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                return;
+            }
+            let state = window.state::<AppState>();
+            let targets = state
+                .session_credential_targets
+                .lock()
+                .map(|items| items.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            for target in targets {
+                let _ = credentials::delete_password(&target);
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running TermPilot");
 }
