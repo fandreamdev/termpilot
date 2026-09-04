@@ -21,7 +21,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
 };
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -93,6 +93,41 @@ fn next_event_seq(state: &AppState, session_id: &str, stream: &str) -> u64 {
     let next = sequences.get(&key).copied().unwrap_or(0) + 1;
     sequences.insert(key, next);
     next
+}
+static AUDIT_EVENT_SEQ: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
+fn install_audit_listener(app: AppHandle) {
+    db::set_audit_listener(Arc::new(move |record| {
+        let stream_key = record.session_id.as_deref().unwrap_or("system").to_owned();
+        let seq = AUDIT_EVENT_SEQ
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map(|mut sequences| {
+                let next = sequences.get(&stream_key).copied().unwrap_or(0) + 1;
+                sequences.insert(stream_key.clone(), next);
+                next
+            })
+            .unwrap_or(1);
+        let _ = app.emit(
+            "audit.appended",
+            json!({
+                "event":"audit.appended",
+                "version":1,
+                "seq":seq,
+                "session_id":record.session_id,
+                "correlation_id":record.correlation_id,
+                "occurred_at":record.created_at,
+                "data":{
+                    "audit_event_id":record.event_id,
+                    "event_type":record.event_type,
+                    "severity":record.severity,
+                    "actor":record.actor,
+                    "target_host_id":record.target_host_id,
+                    "hash":record.hash
+                }
+            }),
+        );
+    }));
 }
 fn valid_path(path: &str) -> bool {
     !path.is_empty()
@@ -2843,6 +2878,10 @@ fn main() {
         Arc::new(transport::MockSftpTransport::default())
     };
     tauri::Builder::default()
+        .setup(|app| {
+            install_audit_listener(app.handle().clone());
+            Ok(())
+        })
         .manage(AppState {
             db: Arc::new(Mutex::new(conn)),
             emergency_stop: AtomicBool::new(false),

@@ -7,7 +7,31 @@ use sha2::Digest;
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
 };
+
+#[derive(Clone, Debug)]
+pub struct AuditRecord {
+    pub event_id: String,
+    pub event_type: String,
+    pub severity: String,
+    pub actor: String,
+    pub target_host_id: Option<String>,
+    pub session_id: Option<String>,
+    pub correlation_id: String,
+    pub hash: String,
+    pub created_at: String,
+}
+
+type AuditListener = Arc<dyn Fn(AuditRecord) + Send + Sync>;
+static AUDIT_LISTENER: OnceLock<Mutex<Option<AuditListener>>> = OnceLock::new();
+
+pub fn set_audit_listener(listener: AuditListener) {
+    let slot = AUDIT_LISTENER.get_or_init(|| Mutex::new(None));
+    if let Ok(mut current) = slot.lock() {
+        *current = Some(listener);
+    }
+}
 
 pub type SftpOperation = (String, String, Option<String>, Option<String>, String);
 
@@ -237,6 +261,23 @@ pub fn append_audit(
     let canonical = json!({"event_id":event_id,"event_type":event_type,"severity":severity,"actor":actor,"target_host_id":target_host_id,"session_id":session_id,"correlation_id":correlation_id,"payload":payload,"created_at":created_at});
     let hash = audit::chain_hash(&canonical, &prev);
     c.execute("INSERT INTO audit_logs(event_id,event_type,severity,actor,target_host_id,session_id,correlation_id,payload_json,prev_hash,hash,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", params![event_id,event_type,severity,actor,target_host_id,session_id,correlation_id,serde_json::to_string(payload).unwrap_or_else(|_|"{}".into()),prev,hash,created_at])?;
+    let record = AuditRecord {
+        event_id,
+        event_type: event_type.to_owned(),
+        severity: severity.to_owned(),
+        actor: actor.to_owned(),
+        target_host_id: target_host_id.map(str::to_owned),
+        session_id: session_id.map(str::to_owned),
+        correlation_id,
+        hash: hash.clone(),
+        created_at,
+    };
+    let listener = AUDIT_LISTENER
+        .get()
+        .and_then(|slot| slot.lock().ok().and_then(|current| current.clone()));
+    if let Some(listener) = listener {
+        listener(record);
+    }
     Ok(hash)
 }
 pub fn insert_sftp(
