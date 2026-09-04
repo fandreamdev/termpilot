@@ -29,6 +29,7 @@ use transport::{SftpTransport, SshTransport};
 
 struct AppState {
     db: Arc<Mutex<rusqlite::Connection>>,
+    database_degraded: Arc<AtomicBool>,
     emergency_stop: Arc<AtomicBool>,
     emergency_agent_stop: Arc<AtomicBool>,
     stopped_sessions: Arc<Mutex<HashSet<String>>>,
@@ -3103,6 +3104,9 @@ fn app_settings_set(state: State<'_, AppState>, request: Value) -> Envelope<Valu
 
 #[tauri::command]
 fn database_backup(state: State<'_, AppState>, request: Value) -> Envelope<Value> {
+    if state.database_degraded.load(Ordering::SeqCst) {
+        return err("AUDIT_UNAVAILABLE", "数据库处于降级模式，请先恢复有效备份");
+    }
     let Some(path) = val_str(&request, "path") else {
         return err("VALIDATION", "缺少备份路径");
     };
@@ -3246,6 +3250,9 @@ fn database_restore(state: State<'_, AppState>, request: Value) -> Envelope<Valu
     {
         return err("AUDIT_UNAVAILABLE", "数据库已恢复，但审计写入失败");
     }
+    state.database_degraded.store(false, Ordering::SeqCst);
+    state.emergency_stop.store(false, Ordering::SeqCst);
+    state.emergency_agent_stop.store(false, Ordering::SeqCst);
     Envelope::ok(json!({"restored":true}))
 }
 
@@ -3308,6 +3315,9 @@ fn emergency_stop(app: AppHandle, state: State<'_, AppState>, request: Value) ->
 }
 #[tauri::command]
 fn emergency_stop_clear(state: State<'_, AppState>, request: Value) -> Envelope<bool> {
+    if state.database_degraded.load(Ordering::SeqCst) {
+        return err("AUDIT_UNAVAILABLE", "数据库处于降级模式，请先恢复有效备份");
+    }
     if !request
         .get("confirmed")
         .and_then(Value::as_bool)
@@ -3336,7 +3346,23 @@ fn emergency_stop_clear(state: State<'_, AppState>, request: Value) -> Envelope<
 }
 
 fn main() {
-    let conn = db::open().expect("database initialization failed");
+    let (conn, database_degraded) = match db::open() {
+        Ok(connection) => (connection, false),
+        Err(error) => {
+            // Keep the UI available for diagnostics and database restore, but
+            // never permit remote work while the on-disk database is invalid.
+            eprintln!("database initialization failed; starting in degraded mode: {error}");
+            let connection = rusqlite::Connection::open_in_memory()
+                .expect("in-memory diagnostic database initialization failed");
+            connection
+                .execute_batch(include_str!("../migrations/001_init.sql"))
+                .expect("in-memory diagnostic schema initialization failed");
+            connection
+                .execute_batch(include_str!("../migrations/002_status_completed.sql"))
+                .expect("in-memory diagnostic migration initialization failed");
+            (connection, true)
+        }
+    };
     let app_config = config::load();
     let model = model_client::from_config(&app_config);
     let use_openssh = std::env::var("TERMPILOT_TRANSPORT")
@@ -3360,7 +3386,8 @@ fn main() {
         })
         .manage(AppState {
             db: Arc::new(Mutex::new(conn)),
-            emergency_stop: Arc::new(AtomicBool::new(false)),
+            database_degraded: Arc::new(AtomicBool::new(database_degraded)),
+            emergency_stop: Arc::new(AtomicBool::new(database_degraded)),
             emergency_agent_stop: Arc::new(AtomicBool::new(false)),
             stopped_sessions: Arc::new(Mutex::new(HashSet::new())),
             event_seq: Arc::new(Mutex::new(HashMap::new())),
@@ -3463,6 +3490,7 @@ mod app_tests {
             .unwrap();
         let state = AppState {
             db: Arc::new(Mutex::new(conn)),
+            database_degraded: Arc::new(AtomicBool::new(false)),
             emergency_stop: Arc::new(AtomicBool::new(false)),
             emergency_agent_stop: Arc::new(AtomicBool::new(false)),
             stopped_sessions: Arc::new(Mutex::new(HashSet::new())),
