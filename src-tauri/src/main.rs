@@ -1042,20 +1042,29 @@ fn perform_transfer(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_transfer(
     db: &rusqlite::Connection,
     app: &AppHandle,
     seq_state: &Arc<Mutex<HashMap<(String, String), u64>>>,
+    emergency_stop: &AtomicBool,
+    stopped_sessions: &Mutex<HashSet<String>>,
     id: &str,
     session: &str,
     op: &str,
     result: Result<(i64, Option<String>), transport::TransportError>,
 ) {
-    if result.is_err()
-        && result
-            .as_ref()
-            .err()
-            .is_some_and(|e| e.to_string().contains("cancelled"))
+    let emergency_cancelled = emergency_stop.load(Ordering::SeqCst)
+        || stopped_sessions
+            .lock()
+            .map(|sessions| sessions.contains(session))
+            .unwrap_or(true);
+    if emergency_cancelled
+        || result.is_err()
+            && result
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.to_string().contains("cancelled"))
     {
         let _ = db::update_sftp_status(db, id, "cancelled");
         let _ = db::append_audit(
@@ -1182,6 +1191,8 @@ fn spawn_transfer_task(
     let db_for_task = state.db.clone();
     let sftp_for_task = state.sftp.clone();
     let seq_for_task = state.event_seq.clone();
+    let emergency_for_task = state.emergency_stop.clone();
+    let stopped_for_task = state.stopped_sessions.clone();
     let app_for_task = app.clone();
     let id_for_task = id.to_owned();
     let session_for_task = session.to_owned();
@@ -1204,6 +1215,8 @@ fn spawn_transfer_task(
                 &db,
                 &app_for_task,
                 &seq_for_task,
+                emergency_for_task.as_ref(),
+                stopped_for_task.as_ref(),
                 &id_for_task,
                 &session_for_task,
                 &op_for_task,
@@ -1401,6 +1414,10 @@ fn sftp_transfer_start(
         );
         return Envelope::ok(json!({"transfer_id":id,"status":"running"}));
     }
+    // Synchronous file operations still perform remote I/O.  Do not hold the
+    // SQLite mutex while waiting so emergency-stop and other sessions remain
+    // responsive.
+    drop(conn);
     let result: Result<(i64, Option<String>), transport::TransportError> = match op.as_str() {
         "upload" => {
             let local = src.as_deref().unwrap();
@@ -1470,7 +1487,14 @@ fn sftp_transfer_start(
             .map(|_| (0, None)),
         _ => unreachable!(),
     };
-    if state.sftp.is_cancelled(&id) {
+    let conn = state.db.lock().unwrap();
+    let emergency_cancelled = state.emergency_stop.load(Ordering::SeqCst)
+        || state
+            .stopped_sessions
+            .lock()
+            .map(|sessions| sessions.contains(&session))
+            .unwrap_or(true);
+    if emergency_cancelled || state.sftp.is_cancelled(&id) {
         let _ = db::update_sftp_status(&conn, &id, "cancelled");
         let _ = db::append_audit(
             &conn,
@@ -2165,6 +2189,7 @@ fn run_read_only_command(state: State<'_, AppState>, request: Value) -> Envelope
         );
         return err("CANCELLED", "工具请求已超过 deadline");
     }
+    drop(conn);
     let (raw_output, exit_code) =
         match state
             .ssh
@@ -2172,6 +2197,7 @@ fn run_read_only_command(state: State<'_, AppState>, request: Value) -> Envelope
         {
             Ok(v) => v,
             Err(_) => {
+                let conn = state.db.lock().unwrap();
                 let _ = conn.execute(
                     "UPDATE execution_records SET status='failed',ended_at=? WHERE id=?",
                     rusqlite::params![Utc::now().to_rfc3339(), execution_id],
@@ -2179,9 +2205,18 @@ fn run_read_only_command(state: State<'_, AppState>, request: Value) -> Envelope
                 return err("SSH_TIMEOUT", "远程只读命令执行失败");
             }
         };
+    let conn = state.db.lock().unwrap();
+    let cancelled = state.emergency_stop.load(Ordering::SeqCst)
+        || state
+            .stopped_sessions
+            .lock()
+            .map(|sessions| sessions.contains(&session_id))
+            .unwrap_or(true);
     let output = policy::redact_sensitive(&String::from_utf8_lossy(&raw_output));
     let output_hash = hex::encode(sha2::Sha256::digest(&raw_output));
-    let execution_status = if exit_code == 0 {
+    let execution_status = if cancelled {
+        "cancelled"
+    } else if exit_code == 0 {
         "succeeded"
     } else {
         "failed"
@@ -2196,6 +2231,9 @@ fn run_read_only_command(state: State<'_, AppState>, request: Value) -> Envelope
         return err("AUDIT_UNAVAILABLE", "无法记录执行结果");
     }
     if db::append_audit(&conn, "command.executed", "info", "agent", None, Some(&session_id), &json!({"argv":args,"authorization_type":"policy_allowlist","stdout_hash":output_hash,"output_bytes":raw_output.len(),"exit_code":exit_code})).is_err() { return err("AUDIT_UNAVAILABLE", "审计不可用，已阻止执行"); }
+    if cancelled {
+        return err("CANCELLED", "远程只读命令已被急停");
+    }
     Envelope::ok(
         json!({"session_id":session_id,"argv":args,"status":if exit_code==0{"completed"}else{"failed"},"stdout":output,"stdout_hash":output_hash,"output_bytes":raw_output.len(),"truncated":raw_output.len()>=64*1024,"risk":"low"}),
     )
@@ -2366,6 +2404,7 @@ fn execute_approved_command(state: State<'_, AppState>, request: Value) -> Envel
         );
         return err("CANCELLED", "工具请求已超过 deadline");
     }
+    drop(conn);
     let (raw_output, exit_code) = match state.ssh.execute_structured_capture(
         &session_id,
         &args,
@@ -2375,6 +2414,7 @@ fn execute_approved_command(state: State<'_, AppState>, request: Value) -> Envel
     ) {
         Ok(value) => value,
         Err(_) => {
+            let conn = state.db.lock().unwrap();
             let _ = conn.execute(
                 "UPDATE execution_records SET status='failed',ended_at=? WHERE id=?",
                 rusqlite::params![Utc::now().to_rfc3339(), execution_id],
@@ -2382,15 +2422,27 @@ fn execute_approved_command(state: State<'_, AppState>, request: Value) -> Envel
             return err("SSH_TIMEOUT", "远程命令执行失败");
         }
     };
+    let conn = state.db.lock().unwrap();
+    let cancelled = state.emergency_stop.load(Ordering::SeqCst)
+        || state
+            .stopped_sessions
+            .lock()
+            .map(|sessions| sessions.contains(&session_id))
+            .unwrap_or(true);
     let stdout = policy::redact_sensitive(&String::from_utf8_lossy(&raw_output));
     let stdout_hash = hex::encode(sha2::Sha256::digest(&raw_output));
-    let execution_status = if exit_code == 0 {
+    let execution_status = if cancelled {
+        "cancelled"
+    } else if exit_code == 0 {
         "succeeded"
     } else {
         "failed"
     };
     let _ = conn.execute("UPDATE execution_records SET status=?,ended_at=?,exit_code=?,stdout_hash=?,output_bytes=? WHERE id=?", rusqlite::params![execution_status,Utc::now().to_rfc3339(),exit_code,stdout_hash,raw_output.len() as i64,execution_id]);
     if db::append_audit(&conn, "command.executed", "warning", "user", None, Some(&session_id), &json!({"approval_id":id,"execution_id":execution_id,"argv":args,"cwd":cwd,"stdout_hash":stdout_hash,"output_bytes":raw_output.len(),"exit_code":exit_code})).is_err() { return err("AUDIT_UNAVAILABLE", "审计不可用"); }
+    if cancelled {
+        return err("CANCELLED", "远程命令已被急停");
+    }
     Envelope::ok(
         json!({"approval_id":id,"execution_id":execution_id,"session_id":session_id,"argv":args,"status":if exit_code==0{"completed"}else{"failed"},"stdout":stdout,"stdout_hash":stdout_hash,"output_bytes":raw_output.len(),"truncated":raw_output.len()>=64*1024*1024}),
     )
