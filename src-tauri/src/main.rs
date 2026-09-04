@@ -341,6 +341,22 @@ fn normalized_agent_tool_call(value: &str) -> Option<String> {
     .ok()
 }
 
+/// Keep emitted event payloads below the 64 KiB contract even when the model
+/// response contains multi-byte UTF-8 characters. Truncation always ends at a
+/// valid character boundary.
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let end = value
+        .char_indices()
+        .take_while(|(index, _)| *index < max_bytes)
+        .map(|(index, _)| index)
+        .last()
+        .unwrap_or(0);
+    value[..end].to_owned()
+}
+
 fn audit_event(
     state: &AppState,
     event_type: &str,
@@ -2751,6 +2767,7 @@ fn run_agent_task(
         Err(_) => ("模型暂不可用，请使用终端手动操作。".to_owned(), "error"),
     };
     let response = policy::redact_sensitive(&response);
+    let event_response = truncate_utf8(&response, 48 * 1024);
     let Ok(conn) = db.lock() else {
         if let Ok(mut items) = cancelled.lock() {
             items.remove(&task_id);
@@ -2806,7 +2823,7 @@ fn run_agent_task(
     let seq = next_seq_for(&event_seq, &session_id, "agent");
     let _ = app.emit(
         "agent.delta",
-        json!({"event":"agent.delta","version":1,"seq":seq,"session_id":session_id,"correlation_id":task_id,"occurred_at":Utc::now().to_rfc3339(),"data":{"task_id":task_id,"conversation_id":conversation_id,"status":model_status,"delta":response}}),
+        json!({"event":"agent.delta","version":1,"seq":seq,"session_id":session_id,"correlation_id":task_id,"occurred_at":Utc::now().to_rfc3339(),"data":{"task_id":task_id,"conversation_id":conversation_id,"status":model_status,"delta":event_response}}),
     );
     if let Ok(mut items) = cancelled.lock() {
         items.remove(&task_id);
@@ -3426,6 +3443,13 @@ mod app_tests {
         assert!(
             normalized_agent_tool_call(r#"{"tool":"read_remote_file","arguments":[]}"#).is_none()
         );
+    }
+
+    #[test]
+    fn emitted_agent_text_is_bounded_on_utf8_boundaries() {
+        let text = truncate_utf8(&"中".repeat(30_000), 48 * 1024);
+        assert!(text.len() <= 48 * 1024);
+        assert_eq!(text.chars().count() * "中".len(), text.len());
     }
 
     #[test]
