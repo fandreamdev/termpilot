@@ -446,7 +446,7 @@ function HostsPage({
         String(form.get("endpoint_fingerprint") ?? "") || undefined,
     };
     const response = await api.hostUpsert({ ...value, policy_id: "default" });
-    if (!response.ok && !import.meta.env.DEV) {
+    if (!response.ok) {
       window.alert(response.error?.message ?? "保存失败");
       return;
     }
@@ -469,7 +469,7 @@ function HostsPage({
         secret: secret || undefined,
         retention_mode: retention,
       });
-      if (!credential.ok && !import.meta.env.DEV) {
+      if (!credential.ok) {
         window.alert(credential.error?.message ?? "凭据保存失败");
         return;
       }
@@ -493,7 +493,7 @@ function HostsPage({
   const remove = async (host: Host) => {
     if (!window.confirm(`软删除主机“${host.name}”？`)) return;
     const response = await api.hostDelete(host.id);
-    if (!response.ok && !import.meta.env.DEV) {
+    if (!response.ok) {
       window.alert(response.error?.message ?? "删除失败");
       return;
     }
@@ -769,7 +769,7 @@ function SftpPage({
       session_id: session.id,
       ...request,
     });
-    if (!response.ok && !import.meta.env.DEV) {
+    if (!response.ok) {
       window.alert(response.error?.message ?? "SFTP 操作失败");
       return;
     }

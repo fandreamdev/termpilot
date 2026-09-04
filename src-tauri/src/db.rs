@@ -334,6 +334,10 @@ pub fn set_setting(
         return Err(rusqlite::Error::InvalidParameterName("setting type".into()));
     }
     let lower = key.to_ascii_lowercase();
+    let compact: String = lower
+        .chars()
+        .filter(|value| value.is_ascii_alphanumeric())
+        .collect();
     if [
         "password",
         "token",
@@ -344,16 +348,37 @@ pub fn set_setting(
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+        || [
+            "password",
+            "passwd",
+            "token",
+            "secret",
+            "privatekey",
+            "apikey",
+            "accesskey",
+            "clientsecret",
+            "accesstoken",
+            "credential",
+        ]
+        .iter()
+        .any(|needle| compact.contains(needle))
     {
         return Err(rusqlite::Error::InvalidParameterName(
             "secret setting".into(),
         ));
     }
     let value_lower = value.to_ascii_lowercase();
+    let value_compact: String = value_lower
+        .chars()
+        .filter(|value| value.is_ascii_alphanumeric())
+        .collect();
     if value_lower.contains("-----begin")
         || value_lower.contains("password=")
         || value_lower.contains("token=")
         || value_lower.contains("api_key=")
+        || value_compact.contains("apikey")
+        || value_compact.contains("accesskey")
+        || value_compact.contains("clientsecret")
     {
         return Err(rusqlite::Error::InvalidParameterName("secret value".into()));
     }
@@ -566,5 +591,6 @@ mod tests {
             .unwrap();
         assert!(set_setting(&c, "model", r#"{"token":"abc"}"#, "json").is_err());
         assert!(set_setting(&c, "model", r#"{"provider":"ollama"}"#, "json").is_ok());
+        assert!(set_setting(&c, "modelApiKey", "hidden", "string").is_err());
     }
 }

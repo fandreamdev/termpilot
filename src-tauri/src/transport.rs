@@ -101,6 +101,7 @@ pub trait SftpTransport: Send + Sync {
     }
     fn upload_from_path(
         &self,
+        _transfer_id: Option<&str>,
         _session_id: &str,
         _local: &std::path::Path,
         _remote: &str,
@@ -113,6 +114,7 @@ pub trait SftpTransport: Send + Sync {
     }
     fn download_to_path(
         &self,
+        _transfer_id: Option<&str>,
         _session_id: &str,
         _remote: &str,
         _local: &std::path::Path,
@@ -147,6 +149,9 @@ pub trait SftpTransport: Send + Sync {
     ) -> Result<(), TransportError>;
     fn mkdir(&self, session_id: &str, path: &str) -> Result<(), TransportError>;
     fn cancel(&self, transfer_id: &str);
+    /// Clear a cancellation marker before a paused transfer is resumed.
+    /// Transports that do not keep cancellation state can use the default.
+    fn clear_cancelled(&self, _transfer_id: &str) {}
     fn is_cancelled(&self, _transfer_id: &str) -> bool {
         false
     }
@@ -532,15 +537,17 @@ struct SftpEndpoint {
 }
 pub struct OpenSftpTransport {
     sessions: Mutex<HashMap<String, SftpEndpoint>>,
-    cancelled: Mutex<HashSet<String>>,
+    cancelled: Arc<Mutex<HashSet<String>>>,
     child_pids: Arc<Mutex<HashMap<String, HashSet<u32>>>>,
+    transfer_pids: Arc<Mutex<HashMap<String, u32>>>,
 }
 impl Default for OpenSftpTransport {
     fn default() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
-            cancelled: Mutex::new(HashSet::new()),
+            cancelled: Arc::new(Mutex::new(HashSet::new())),
             child_pids: Arc::new(Mutex::new(HashMap::new())),
+            transfer_pids: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -568,7 +575,12 @@ impl OpenSftpTransport {
         }
     }
 
-    fn batch(&self, session_id: &str, commands: &[String]) -> Result<String, TransportError> {
+    fn batch(
+        &self,
+        session_id: &str,
+        transfer_id: Option<&str>,
+        commands: &[String],
+    ) -> Result<String, TransportError> {
         let endpoint = self
             .sessions
             .lock()
@@ -623,8 +635,17 @@ impl OpenSftpTransport {
         if let Ok(mut values) = self.child_pids.lock() {
             values.entry(session_id.to_owned()).or_default().insert(pid);
         }
+        let transfer_pids = self.transfer_pids.clone();
+        let transfer_id = transfer_id.map(str::to_owned);
+        if let Some(transfer_id) = transfer_id.as_deref() {
+            if let Ok(mut values) = self.transfer_pids.lock() {
+                values.insert(transfer_id.to_owned(), pid);
+            }
+        }
         let child_pids = self.child_pids.clone();
         let child_session = session_id.to_owned();
+        let transfer_id_for_thread = transfer_id.clone();
+        let cancelled = self.cancelled.clone();
         let mut stdout = child
             .stdout
             .take()
@@ -649,6 +670,13 @@ impl OpenSftpTransport {
                                     }
                                 }
                             }
+                            if let Some(transfer_id) = transfer_id_for_thread.as_deref() {
+                                if let Ok(mut values) = transfer_pids.lock() {
+                                    if values.get(transfer_id) == Some(&pid) {
+                                        values.remove(transfer_id);
+                                    }
+                                }
+                            }
                             let _ = sender.send(Err(TransportError::Unavailable(
                                 "sftp output limit exceeded".into(),
                             )));
@@ -667,6 +695,13 @@ impl OpenSftpTransport {
                                 }
                             }
                         }
+                        if let Some(transfer_id) = transfer_id_for_thread.as_deref() {
+                            if let Ok(mut values) = transfer_pids.lock() {
+                                if values.get(transfer_id) == Some(&pid) {
+                                    values.remove(transfer_id);
+                                }
+                            }
+                        }
                         let _ = sender.send(Err(TransportError::Unavailable(
                             "sftp stdout read failed".into(),
                         )));
@@ -678,7 +713,14 @@ impl OpenSftpTransport {
                 .wait()
                 .map_err(|e| TransportError::Unavailable(e.to_string()))
                 .and_then(|status| {
-                    if status.success() {
+                    if transfer_id_for_thread.as_deref().is_some_and(|id| {
+                        cancelled
+                            .lock()
+                            .map(|items| items.contains(id))
+                            .unwrap_or(true)
+                    }) {
+                        Err(TransportError::Unavailable("cancelled".into()))
+                    } else if status.success() {
                         Ok(String::from_utf8_lossy(&bytes).into_owned())
                     } else {
                         Err(TransportError::Unavailable("sftp operation failed".into()))
@@ -692,6 +734,13 @@ impl OpenSftpTransport {
                     }
                 }
             }
+            if let Some(transfer_id) = transfer_id_for_thread.as_deref() {
+                if let Ok(mut values) = transfer_pids.lock() {
+                    if values.get(transfer_id) == Some(&pid) {
+                        values.remove(transfer_id);
+                    }
+                }
+            }
             let _ = sender.send(result);
         });
         match receiver.recv_timeout(std::time::Duration::from_secs(600)) {
@@ -699,18 +748,27 @@ impl OpenSftpTransport {
             Err(_) => {
                 Self::kill_pid(pid);
                 self.kill_session_children(session_id);
+                if let Some(transfer_id) = transfer_id.as_deref() {
+                    if let Ok(mut values) = self.transfer_pids.lock() {
+                        values.remove(transfer_id);
+                    }
+                }
                 Err(TransportError::Timeout)
             }
         }
     }
-    fn remote_exists(&self, session_id: &str, path: &str) -> bool {
-        self.batch(session_id, &[format!("ls {}", sftp_quote(path))])
-            .map(|output| {
-                output
-                    .lines()
-                    .any(|line| !line.trim().is_empty() && !line.trim().starts_with("sftp>"))
-            })
-            .unwrap_or(false)
+    fn remote_exists(&self, session_id: &str, path: &str, transfer_id: Option<&str>) -> bool {
+        self.batch(
+            session_id,
+            transfer_id,
+            &[format!("ls {}", sftp_quote(path))],
+        )
+        .map(|output| {
+            output
+                .lines()
+                .any(|line| !line.trim().is_empty() && !line.trim().starts_with("sftp>"))
+        })
+        .unwrap_or(false)
     }
 }
 impl SftpTransport for OpenSftpTransport {
@@ -755,12 +813,16 @@ impl SftpTransport for OpenSftpTransport {
         if let Ok(mut sessions) = self.sessions.lock() {
             sessions.clear();
         }
+        if let Ok(mut transfers) = self.transfer_pids.lock() {
+            transfers.clear();
+        }
     }
     fn supports_safe_append(&self) -> bool {
         false
     }
     fn upload_from_path(
         &self,
+        transfer_id: Option<&str>,
         session_id: &str,
         local: &std::path::Path,
         remote: &str,
@@ -773,11 +835,12 @@ impl SftpTransport for OpenSftpTransport {
             return Err(TransportError::Unavailable("file too large".into()));
         }
         let command = if resume { "reput" } else { "put" };
-        if !overwrite && !resume && self.remote_exists(session_id, remote) {
+        if !overwrite && !resume && self.remote_exists(session_id, remote, transfer_id) {
             return Err(TransportError::Unavailable("destination exists".into()));
         }
         self.batch(
             session_id,
+            transfer_id,
             &[format!(
                 "{command} {} {}",
                 sftp_quote(&local.to_string_lossy()),
@@ -788,6 +851,7 @@ impl SftpTransport for OpenSftpTransport {
     }
     fn download_to_path(
         &self,
+        transfer_id: Option<&str>,
         session_id: &str,
         remote: &str,
         local: &std::path::Path,
@@ -800,6 +864,7 @@ impl SftpTransport for OpenSftpTransport {
         let command = if resume { "reget" } else { "get" };
         let _ = self.batch(
             session_id,
+            transfer_id,
             &[format!(
                 "{command} {} {}",
                 sftp_quote(remote),
@@ -814,7 +879,7 @@ impl SftpTransport for OpenSftpTransport {
         Ok((metadata.len(), hash_file(local)?))
     }
     fn list(&self, session_id: &str, path: &str) -> Result<Vec<String>, TransportError> {
-        let output = self.batch(session_id, &[format!("ls -1 {}", sftp_quote(path))])?;
+        let output = self.batch(session_id, None, &[format!("ls -1 {}", sftp_quote(path))])?;
         Ok(output
             .lines()
             .map(str::trim)
@@ -825,7 +890,11 @@ impl SftpTransport for OpenSftpTransport {
             .collect())
     }
     fn realpath(&self, session_id: &str, path: &str) -> Result<String, TransportError> {
-        let output = self.batch(session_id, &[format!("realpath {}", sftp_quote(path))])?;
+        let output = self.batch(
+            session_id,
+            None,
+            &[format!("realpath {}", sftp_quote(path))],
+        )?;
         output
             .lines()
             .map(str::trim)
@@ -844,6 +913,7 @@ impl SftpTransport for OpenSftpTransport {
         let result = (|| {
             self.batch(
                 session_id,
+                None,
                 &[format!(
                     "get {} {}",
                     sftp_quote(path),
@@ -868,7 +938,7 @@ impl SftpTransport for OpenSftpTransport {
         bytes: &[u8],
         overwrite: bool,
     ) -> Result<(), TransportError> {
-        if !overwrite && self.remote_exists(session_id, path) {
+        if !overwrite && self.remote_exists(session_id, path, None) {
             return Err(TransportError::Unavailable("destination exists".into()));
         }
         let temp =
@@ -887,12 +957,12 @@ impl SftpTransport for OpenSftpTransport {
                 sftp_quote(path)
             )
         };
-        let result = self.batch(session_id, &[command]);
+        let result = self.batch(session_id, None, &[command]);
         let _ = std::fs::remove_file(temp);
         result.map(|_| ())
     }
     fn delete(&self, session_id: &str, path: &str) -> Result<(), TransportError> {
-        self.batch(session_id, &[format!("rm {}", sftp_quote(path))])
+        self.batch(session_id, None, &[format!("rm {}", sftp_quote(path))])
             .map(|_| ())
     }
     fn rename(
@@ -902,11 +972,12 @@ impl SftpTransport for OpenSftpTransport {
         destination: &str,
         overwrite: bool,
     ) -> Result<(), TransportError> {
-        if !overwrite && self.remote_exists(session_id, destination) {
+        if !overwrite && self.remote_exists(session_id, destination, None) {
             return Err(TransportError::Unavailable("destination exists".into()));
         }
         self.batch(
             session_id,
+            None,
             &[format!(
                 "rename {} {}",
                 sftp_quote(source),
@@ -916,12 +987,28 @@ impl SftpTransport for OpenSftpTransport {
         .map(|_| ())
     }
     fn mkdir(&self, session_id: &str, path: &str) -> Result<(), TransportError> {
-        self.batch(session_id, &[format!("mkdir {}", sftp_quote(path))])
+        self.batch(session_id, None, &[format!("mkdir {}", sftp_quote(path))])
             .map(|_| ())
     }
     fn cancel(&self, transfer_id: &str) {
         if let Ok(mut cancelled) = self.cancelled.lock() {
             cancelled.insert(transfer_id.to_owned());
+        }
+        let pid = self
+            .transfer_pids
+            .lock()
+            .ok()
+            .and_then(|values| values.get(transfer_id).copied());
+        if let Some(pid) = pid {
+            Self::kill_pid(pid);
+        }
+    }
+    fn clear_cancelled(&self, transfer_id: &str) {
+        if let Ok(mut cancelled) = self.cancelled.lock() {
+            cancelled.remove(transfer_id);
+        }
+        if let Ok(mut values) = self.transfer_pids.lock() {
+            values.remove(transfer_id);
         }
     }
     fn is_cancelled(&self, transfer_id: &str) -> bool {
@@ -984,13 +1071,23 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("termpilot-upload-{}.txt", uuid::Uuid::new_v4()));
         std::fs::write(&path, b"prefix-and-more").unwrap();
-        let result = transport.upload_from_path("session", &path, "~/resume.txt", false, true);
+        let result =
+            transport.upload_from_path(None, "session", &path, "~/resume.txt", false, true);
         assert!(result.is_ok());
         assert_eq!(
             transport.read_file("session", "~/resume.txt", 64).unwrap(),
             b"prefix-and-more"
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cancellation_marker_can_be_cleared_for_resume() {
+        let transport = MockSftpTransport::default();
+        transport.cancel("transfer");
+        assert!(transport.is_cancelled("transfer"));
+        transport.clear_cancelled("transfer");
+        assert!(!transport.is_cancelled("transfer"));
     }
 }
 
@@ -1083,6 +1180,7 @@ impl SftpTransport for MockSftpTransport {
     }
     fn upload_from_path(
         &self,
+        _transfer_id: Option<&str>,
         session_id: &str,
         local: &std::path::Path,
         remote: &str,
@@ -1119,6 +1217,7 @@ impl SftpTransport for MockSftpTransport {
     }
     fn download_to_path(
         &self,
+        _transfer_id: Option<&str>,
         session_id: &str,
         remote: &str,
         local: &std::path::Path,
@@ -1260,6 +1359,11 @@ impl SftpTransport for MockSftpTransport {
     fn cancel(&self, transfer_id: &str) {
         if let Ok(mut cancelled) = self.cancelled.lock() {
             cancelled.insert(transfer_id.to_owned());
+        }
+    }
+    fn clear_cancelled(&self, transfer_id: &str) {
+        if let Ok(mut cancelled) = self.cancelled.lock() {
+            cancelled.remove(transfer_id);
         }
     }
     fn is_cancelled(&self, transfer_id: &str) -> bool {

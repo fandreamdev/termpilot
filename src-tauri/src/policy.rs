@@ -60,6 +60,10 @@ pub fn redact_sensitive(input: &str) -> String {
         .lines()
         .map(|line| {
             let lower = line.to_ascii_lowercase();
+            let compact: String = lower
+                .chars()
+                .filter(|value| value.is_ascii_alphanumeric())
+                .collect();
             if [
                 "password",
                 "passwd",
@@ -83,6 +87,21 @@ pub fn redact_sensitive(input: &str) -> String {
             ]
             .iter()
             .any(|needle| lower.contains(needle))
+                || [
+                    "password",
+                    "passwd",
+                    "token",
+                    "secret",
+                    "privatekey",
+                    "apikey",
+                    "accesskey",
+                    "clientsecret",
+                    "accesstoken",
+                    "authorizationbearer",
+                    "cookie",
+                ]
+                .iter()
+                .any(|needle| compact.contains(needle))
                 || lower.contains("-----begin")
             {
                 "[REDACTED]"
@@ -119,6 +138,10 @@ fn contains_secret_argument(args: &[Value]) -> bool {
         };
         let lower = text.to_ascii_lowercase();
         let key = lower.trim_start_matches('-').replace('-', "_");
+        let compact: String = key
+            .chars()
+            .filter(|value| value.is_ascii_alphanumeric())
+            .collect();
         let looks_like_key = [
             "password",
             "passwd",
@@ -136,7 +159,24 @@ fn contains_secret_argument(args: &[Value]) -> bool {
             "bearer",
         ]
         .iter()
-        .any(|name| key == *name || key.starts_with(&format!("{name}=")));
+        .any(|name| key == *name || key.starts_with(&format!("{name}=")))
+            || [
+                "password",
+                "passwd",
+                "token",
+                "secret",
+                "apikey",
+                "accesskey",
+                "accesstoken",
+                "secretkey",
+                "clientsecret",
+                "passphrase",
+                "credential",
+                "authorization",
+                "bearer",
+            ]
+            .iter()
+            .any(|name| compact == *name || compact.starts_with(name));
         looks_like_key
             || (index > 0
                 && args[index - 1]
@@ -164,6 +204,16 @@ fn contains_secret_argument(args: &[Value]) -> bool {
                                 .trim_start_matches('-')
                                 .replace('-', "_")
                                 .eq_ignore_ascii_case(name)
+                                || previous
+                                    .chars()
+                                    .filter(|value| value.is_ascii_alphanumeric())
+                                    .collect::<String>()
+                                    .eq_ignore_ascii_case(
+                                        &name
+                                            .chars()
+                                            .filter(|value| value.is_ascii_alphanumeric())
+                                            .collect::<String>(),
+                                    )
                         })
                     })
                     .unwrap_or(false))
@@ -303,6 +353,11 @@ mod tests {
         );
         assert_eq!(redact_sensitive("APIKEY=hidden"), "[REDACTED]");
         assert_eq!(redact_sensitive("AWS_ACCESS_KEY=hidden"), "[REDACTED]");
+        assert_eq!(
+            redact_sensitive(r#"{"clientSecret":"hidden"}"#),
+            "[REDACTED]"
+        );
+        assert_eq!(redact_sensitive("accessToken: hidden"), "[REDACTED]");
     }
 
     #[test]
@@ -324,6 +379,9 @@ mod tests {
         ));
         assert!(!validate_structured_command(
             &serde_json::json!({"program":"tool","args":["--api-key","secret-value"]})
+        ));
+        assert!(!validate_structured_command(
+            &serde_json::json!({"program":"tool","args":["--accessKey","secret-value"]})
         ));
         assert_eq!(
             command_risk(&["rm".into(), "-rf".into(), "/".into()]),

@@ -1106,6 +1106,7 @@ fn perform_transfer(
     match op {
         "upload" => sftp
             .upload_from_path(
+                Some(id),
                 session,
                 std::path::Path::new(src.unwrap_or_default()),
                 dst.unwrap_or_default(),
@@ -1125,8 +1126,14 @@ fn perform_transfer(
                 fs::copy(&local, &temp)
                     .map_err(|e| transport::TransportError::Unavailable(e.to_string()))?;
             }
-            let result =
-                sftp.download_to_path(session, src.unwrap_or_default(), &temp, overwrite, resume);
+            let result = sftp.download_to_path(
+                Some(id),
+                session,
+                src.unwrap_or_default(),
+                &temp,
+                overwrite,
+                resume,
+            );
             match result {
                 Ok((size, hash)) => {
                     if local.exists() && !resume && !overwrite {
@@ -1173,11 +1180,30 @@ fn finish_transfer(
     op: &str,
     result: Result<(i64, Option<String>), transport::TransportError>,
 ) {
+    // A pause cancels the current best-effort I/O operation. Read the state
+    // before interpreting that transport error so the worker cannot overwrite
+    // the user-requested paused status with cancelled/failed.
+    let current_status: String = db
+        .query_row("SELECT status FROM sftp_operations WHERE id=?", [id], |r| {
+            r.get(0)
+        })
+        .unwrap_or_else(|_| "running".into());
     let emergency_cancelled = emergency_stop.load(Ordering::SeqCst)
         || stopped_sessions
             .lock()
             .map(|sessions| sessions.contains(session))
             .unwrap_or(true);
+    if current_status == "paused" && !emergency_cancelled {
+        if result.is_err() {
+            let _ = db::update_sftp_progress(db, id, 0, None, None, Some("PAUSED"));
+        }
+        let seq = next_seq_for(seq_state, session, "transfer");
+        let _ = app.emit(
+            "transfer.progress",
+            json!({"event":"transfer.progress","version":1,"seq":seq,"session_id":session,"correlation_id":id,"occurred_at":Utc::now().to_rfc3339(),"data":{"transfer_id":id,"status":"paused"}}),
+        );
+        return;
+    }
     if emergency_cancelled
         || result.is_err()
             && result
@@ -1210,17 +1236,8 @@ fn finish_transfer(
                 .query_row("SELECT status FROM sftp_operations WHERE id=?", [id], |r| {
                     r.get(0)
                 })
-                .unwrap_or_else(|_| "running".into());
+                .unwrap_or_else(|_| current_status.clone());
             if current == "cancelled" {
-                let _ = db::append_audit(
-                    db,
-                    "sftp.cancelled",
-                    "warning",
-                    "user",
-                    None,
-                    Some(session),
-                    &json!({"transfer_id":id,"operation":op}),
-                );
                 return;
             }
             if current == "paused" {
@@ -1231,6 +1248,11 @@ fn finish_transfer(
                     Some(transferred),
                     hash.as_deref(),
                     Some("PAUSED"),
+                );
+                let seq = next_seq_for(seq_state, session, "transfer");
+                let _ = app.emit(
+                    "transfer.progress",
+                    json!({"event":"transfer.progress","version":1,"seq":seq,"session_id":session,"correlation_id":id,"occurred_at":Utc::now().to_rfc3339(),"data":{"transfer_id":id,"status":"paused","transferred_bytes":transferred,"size_bytes":transferred}}),
                 );
                 return;
             }
@@ -1256,6 +1278,27 @@ fn finish_transfer(
             let _ = app.emit("transfer.progress", json!({"event":"transfer.progress","version":1,"seq":seq,"session_id":session,"correlation_id":id,"occurred_at":Utc::now().to_rfc3339(),"data":{"transfer_id":id,"status":"completed","transferred_bytes":transferred,"size_bytes":transferred,"content_hash":hash}}));
         }
         Err(error) => {
+            // Cancellation races with process teardown are reported by
+            // OpenSSH as a generic pipe/read error. The persisted status is
+            // authoritative, so never rewrite an already-cancelled task as
+            // failed.
+            let current: String = db
+                .query_row("SELECT status FROM sftp_operations WHERE id=?", [id], |r| {
+                    r.get(0)
+                })
+                .unwrap_or_else(|_| current_status.clone());
+            if current == "cancelled" {
+                let _ = db::append_audit(
+                    db,
+                    "sftp.cancelled",
+                    "warning",
+                    "user",
+                    None,
+                    Some(session),
+                    &json!({"transfer_id":id,"operation":op}),
+                );
+                return;
+            }
             let code = if error.to_string().contains("destination exists") {
                 "SFTP_CONFLICT"
             } else {
@@ -1342,6 +1385,9 @@ fn spawn_transfer_task(
                 result,
             );
         }
+        // The terminal state is now persisted; release the transport marker
+        // so a later retry/resume is not rejected by stale cancellation state.
+        sftp_for_task.clear_cancelled(&id_for_task);
     });
 }
 
@@ -1543,6 +1589,7 @@ fn sftp_transfer_start(
             state
                 .sftp
                 .upload_from_path(
+                    Some(&id),
                     &session,
                     std::path::Path::new(local),
                     dst.as_deref().unwrap(),
@@ -1564,6 +1611,7 @@ fn sftp_transfer_start(
                 return err("INTERNAL", "无法准备下载续传临时文件");
             }
             let downloaded = state.sftp.download_to_path(
+                Some(&id),
                 &session,
                 src.as_deref().unwrap(),
                 &temp,
@@ -1881,6 +1929,12 @@ fn transfer_status(
     request: Value,
     status: &'static str,
 ) -> Envelope<Value> {
+    // Pausing/resuming are still SFTP control operations. Once an emergency
+    // stop is active, reject new control requests as well; cancellation that
+    // is part of the emergency-stop path is performed internally.
+    if state.emergency_stop.load(Ordering::SeqCst) {
+        return err("EMERGENCY_STOP_ACTIVE", "急停状态已启用");
+    }
     let Some(id) = val_str(&request, "transfer_id") else {
         return err("VALIDATION", "缺少 transfer_id");
     };
@@ -1904,6 +1958,11 @@ fn transfer_status(
     }
     if db::update_sftp_status(&conn, &id, status).is_err() {
         return err("CONFLICT", "传输任务状态更新失败");
+    }
+    if status == "paused" {
+        // OpenSSH transfers are best-effort batch processes. Cancelling the
+        // worker leaves its .part file in place so resume can continue later.
+        state.sftp.cancel(&id);
     }
     if db::append_audit(
         &conn,
@@ -1939,6 +1998,9 @@ fn transfer_pause(app: AppHandle, state: State<'_, AppState>, request: Value) ->
 }
 #[tauri::command]
 fn transfer_resume(app: AppHandle, state: State<'_, AppState>, request: Value) -> Envelope<Value> {
+    if state.emergency_stop.load(Ordering::SeqCst) {
+        return err("EMERGENCY_STOP_ACTIVE", "急停状态已启用");
+    }
     let Some(id) = val_str(&request, "transfer_id") else {
         return err("VALIDATION", "缺少 transfer_id");
     };
@@ -1949,6 +2011,7 @@ fn transfer_resume(app: AppHandle, state: State<'_, AppState>, request: Value) -
     if status != "paused" {
         return err("CONFLICT", "只有暂停中的任务可以恢复");
     }
+    state.sftp.clear_cancelled(&id);
     if let Some(x) = reject_if_session_stopped(&state, &session_id) {
         return x;
     }
@@ -2426,6 +2489,12 @@ fn propose_command(app: AppHandle, state: State<'_, AppState>, request: Value) -
     )
     .is_err()
     {
+        // Do not leave an executable pending ticket when its authorization
+        // event could not be committed to the audit chain.
+        let _ = conn.execute(
+            "UPDATE command_approvals SET status='expired',decided_at=? WHERE id=? AND status='pending'",
+            rusqlite::params![Utc::now().to_rfc3339(), approval_id],
+        );
         return err("AUDIT_UNAVAILABLE", "审计不可用");
     }
     let seq = next_event_seq(&state, &session_id, "approval");
@@ -2500,7 +2569,15 @@ fn execute_approved_command(state: State<'_, AppState>, request: Value) -> Envel
     if conn.execute("UPDATE command_approvals SET status='consumed',decided_at=? WHERE id=? AND status='approved'",rusqlite::params![Utc::now().to_rfc3339(),id]).unwrap_or(0)!=1{return err("APPROVAL_EXPIRED","审批票据不可重放")};
     let execution_id = uuid::Uuid::new_v4().to_string();
     let started = Utc::now().to_rfc3339();
-    let _ = conn.execute("INSERT INTO execution_records(id,session_id,approval_id,authorization_type,policy_version,command_hash,started_at,status) VALUES(?,?,?,?,?,?,?,'running')", rusqlite::params![execution_id,session_id,id, "approval", policy_version, command_hash, started]);
+    if conn
+        .execute("INSERT INTO execution_records(id,session_id,approval_id,authorization_type,policy_version,command_hash,started_at,status) VALUES(?,?,?,?,?,?,?,'running')", rusqlite::params![execution_id,session_id,id, "approval", policy_version, command_hash, started])
+        .is_err()
+    {
+        // The approval has already been consumed, so it cannot be replayed;
+        // without an execution record we must fail closed before any remote
+        // command is sent.
+        return err("AUDIT_UNAVAILABLE", "无法记录执行授权，已阻止执行");
+    }
     if db::append_audit(
         &conn,
         "command.authorized",
