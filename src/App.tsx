@@ -92,6 +92,7 @@ export default function App() {
   const [page, setPage] = useState("总览");
   const [hosts, setHosts] = useState<Host[]>([]);
   const [session, setSession] = useState<Session>();
+  const [sessionTabs, setSessionTabs] = useState<Session[]>([]);
   const [agentOpen, setAgentOpen] = useState(true);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [theme, setTheme] = useState<"dark" | "light">("dark");
@@ -113,11 +114,19 @@ export default function App() {
     setTheme(value);
     void api.appSettingsSet({ key: "theme", value, value_type: "string" });
   };
+  const activateSession = (value: Session) => {
+    setSessionTabs((tabs) =>
+      tabs.some((tab) => tab.id === value.id)
+        ? tabs.map((tab) => (tab.id === value.id ? value : tab))
+        : [...tabs, value],
+    );
+    setSession(value);
+    setPage("终端");
+  };
   const connect = async (host: Host) => {
     try {
       const value = await api.connect(host.id, host.endpoint_fingerprint);
-      setSession(value);
-      setPage("终端");
+      activateSession(value);
     } catch (error) {
       const message = error instanceof Error ? error.message : "连接失败";
       const match = message.match(/：((?:SHA256:)?[A-Za-z0-9+/=:_-]+)$/);
@@ -127,8 +136,7 @@ export default function App() {
       ) {
         try {
           const value = await api.connect(host.id, match[1]);
-          setSession(value);
-          setPage("终端");
+          activateSession(value);
         } catch (retryError) {
           window.alert(
             retryError instanceof Error ? retryError.message : "连接失败",
@@ -218,11 +226,13 @@ export default function App() {
           <Terminal
             hosts={hosts}
             session={session}
+            sessionTabs={sessionTabs}
             light={theme === "light"}
             open={agentOpen}
             setOpen={setAgentOpen}
             connect={connect}
             setSession={setSession}
+            setSessionTabs={setSessionTabs}
           />
         ) : page === "主机" ? (
           <HostsPage hosts={hosts} setHosts={setHosts} connect={connect} />
@@ -1209,19 +1219,23 @@ function ShellSurface({
 function Terminal({
   hosts,
   session,
+  sessionTabs,
   light,
   open,
   setOpen,
   connect,
   setSession,
+  setSessionTabs,
 }: {
   hosts: Host[];
   session?: Session;
+  sessionTabs: Session[];
   light: boolean;
   open: boolean;
   setOpen: (v: boolean) => void;
   connect: (h: Host) => void;
   setSession: (s?: Session) => void;
+  setSessionTabs: React.Dispatch<React.SetStateAction<Session[]>>;
 }) {
   const [agentWidth, setAgentWidth] = useState(380);
   const [draft, setDraft] = useState("");
@@ -1236,9 +1250,6 @@ function Terminal({
   const [approvals, setApprovals] = useState<
     Array<{ id: string; risk: string }>
   >([]);
-  const [sessionTabs, setSessionTabs] = useState<Session[]>(
-    session ? [session] : [],
-  );
   const agentBodyRef = useRef<HTMLDivElement>(null);
   const shellRef = useRef<HTMLDivElement>(null);
   const currentHost = hosts.find((h) => h.id === session?.host_id) ?? hosts[0];
@@ -1355,10 +1366,11 @@ function Terminal({
               void api
                 .sessionDisconnect({ session_id: session.id, reason: "user" })
                 .then(() => {
-                  setSessionTabs((tabs) =>
-                    tabs.filter((tab) => tab.id !== session.id),
+                  const remaining = sessionTabs.filter(
+                    (tab) => tab.id !== session.id,
                   );
-                  setSession(undefined);
+                  setSessionTabs(remaining);
+                  setSession(remaining.at(-1));
                 })
             }
           >
