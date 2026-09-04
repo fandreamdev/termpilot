@@ -51,10 +51,6 @@ pub fn open() -> rusqlite::Result<Connection> {
         return Err(error);
     }
     c.execute_batch("COMMIT;")?;
-    c.execute(
-        "UPDATE sftp_operations SET status='completed' WHERE status='succeeded'",
-        [],
-    )?;
     let checksum = hex::encode(sha2::Sha256::digest(
         include_str!("../migrations/001_init.sql").as_bytes(),
     ));

@@ -66,12 +66,18 @@ pub fn redact_sensitive(input: &str) -> String {
                 "token",
                 "secret",
                 "private_key",
+                "private key",
                 "api_key",
+                "api-key",
+                "access_token",
+                "access-token",
+                "authorization: bearer",
                 "authorization",
                 "cookie",
             ]
             .iter()
             .any(|needle| lower.contains(needle))
+                || lower.contains("-----begin")
             {
                 "[REDACTED]"
             } else {
@@ -106,18 +112,53 @@ fn contains_secret_argument(args: &[Value]) -> bool {
             return true;
         };
         let lower = text.to_ascii_lowercase();
-        let key = lower.trim_start_matches('-');
-        let looks_like_key = ["password", "passwd", "token", "secret", "api_key", "apikey"]
-            .iter()
-            .any(|name| key == *name || key.starts_with(&format!("{name}=")));
+        let key = lower.trim_start_matches('-').replace('-', "_");
+        let looks_like_key = [
+            "password",
+            "passwd",
+            "token",
+            "secret",
+            "api_key",
+            "apikey",
+            "access_token",
+            "access_key",
+            "secret_key",
+            "client_secret",
+            "passphrase",
+            "credential",
+            "authorization",
+            "bearer",
+        ]
+        .iter()
+        .any(|name| key == *name || key.starts_with(&format!("{name}=")));
         looks_like_key
             || (index > 0
                 && args[index - 1]
                     .as_str()
                     .map(|previous| {
-                        ["password", "passwd", "token", "secret", "api_key", "apikey"]
-                            .iter()
-                            .any(|name| previous.trim_start_matches('-').eq_ignore_ascii_case(name))
+                        [
+                            "password",
+                            "passwd",
+                            "token",
+                            "secret",
+                            "api_key",
+                            "apikey",
+                            "access_token",
+                            "access_key",
+                            "secret_key",
+                            "client_secret",
+                            "passphrase",
+                            "credential",
+                            "authorization",
+                            "bearer",
+                        ]
+                        .iter()
+                        .any(|name| {
+                            previous
+                                .trim_start_matches('-')
+                                .replace('-', "_")
+                                .eq_ignore_ascii_case(name)
+                        })
                     })
                     .unwrap_or(false))
     })
@@ -133,8 +174,9 @@ fn contains_shell_metacharacters(value: &str) -> bool {
 }
 
 pub fn is_forbidden_program(program: &str) -> bool {
+    let basename = program.rsplit(['/', '\\']).next().unwrap_or(program);
     matches!(
-        program,
+        basename.to_ascii_lowercase().as_str(),
         "sh" | "bash"
             | "zsh"
             | "fish"
@@ -157,13 +199,22 @@ pub fn command_risk(argv: &[String]) -> &'static str {
     }
     if is_fixed_readonly(argv) {
         "low"
-    } else if argv.first().is_some_and(|program| program == "rm")
-        && argv
-            .iter()
-            .any(|arg| arg == "-rf" || arg == "-fr" || arg == "/")
+    } else if argv.first().is_some_and(|program| {
+        program
+            .rsplit(['/', '\\'])
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case("rm"))
+    }) && argv
+        .iter()
+        .any(|arg| arg == "-rf" || arg == "-fr" || arg == "/")
     {
         "blocked"
     } else if argv.first().is_some_and(|program| {
+        let program = program
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(program)
+            .to_ascii_lowercase();
         matches!(
             program.as_str(),
             "rm" | "rmdir"
@@ -236,6 +287,14 @@ mod tests {
     fn sanitization_removes_control_chars_and_limits_size() {
         assert_eq!(sanitize_text("hello\u{0000}\nworld"), "hello\nworld");
         assert!(sanitize_text(&"x".repeat(40_000)).len() <= 32_000);
+        assert_eq!(
+            redact_sensitive("AWS_SECRET_ACCESS_KEY=hidden"),
+            "[REDACTED]"
+        );
+        assert_eq!(
+            redact_sensitive("Authorization: Bearer hidden"),
+            "[REDACTED]"
+        );
     }
 
     #[test]
@@ -250,7 +309,13 @@ mod tests {
             &serde_json::json!({"program":"sh","args":["-c","pwd"]})
         ));
         assert!(!validate_structured_command(
+            &serde_json::json!({"program":"/bin/sh","args":["-c","pwd"]})
+        ));
+        assert!(!validate_structured_command(
             &serde_json::json!({"program":"tool","args":["--token","secret-value"]})
+        ));
+        assert!(!validate_structured_command(
+            &serde_json::json!({"program":"tool","args":["--api-key","secret-value"]})
         ));
         assert_eq!(
             command_risk(&["rm".into(), "-rf".into(), "/".into()]),
@@ -258,6 +323,10 @@ mod tests {
         );
         assert_eq!(
             command_risk(&["bash".into(), "-c".into(), "pwd".into()]),
+            "blocked"
+        );
+        assert_eq!(
+            command_risk(&["/bin/rm".into(), "-rf".into(), "/".into()]),
             "blocked"
         );
     }

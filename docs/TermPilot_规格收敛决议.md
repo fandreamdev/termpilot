@@ -50,6 +50,7 @@
 - 传输 ID：API `transfer_id` 与 `sftp_operations.id` 为同一应用生成的 UUID/ULID。临时文件使用应用专用目录和不可预测名称，完成后通过同一目录内 rename 实现原子替换。
 - 事件序号：`seq` 按 `session_id + stream` 递增；重放 API 必须按 session、stream 和起始 seq 查询，不能复用 `sessions.last_seq` 表示所有任务的全局序号。
 - 取消：取消为尽力而为；最终状态、错误码和审计事件必须写入。应用重启后不自动恢复远程命令，SFTP 仅保留可人工恢复的临时文件。
+- Agent 文件工具：模型不得伪造用户确认；上传、下载、删除、重命名和新目录缺少用户确认时由 Core 阻断，需用户在 SFTP 页面重新确认。
 
 ## 4. 仍然阻塞实现的外部确认项
 

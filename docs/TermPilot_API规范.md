@@ -81,13 +81,13 @@ ID 使用 UUID/ULID；时间使用 UTC RFC3339；长任务返回任务 ID；所�
 
 ### `sftp_transfer_start`
 
-请求 `{session_id,op,src?,dst?,overwrite?:boolean,resume?:boolean}`。`op` 为 `upload|download|delete|rename|mkdir`；单文件上限 20 GiB；本地路径必须由用户按次选择并通过路径校验。生产文件覆盖、删除和上传默认需要人工确认。
+请求 `{session_id,op,src?,dst?,overwrite?:boolean,resume?:boolean}`。`op` 为 `upload|download|delete|rename|mkdir`；单文件上限 20 GiB；本地路径必须由用户按次选择并通过路径校验。生产文件覆盖、删除和上传默认需要人工确认。上传续传只有在服务端确认安全 append 且用户明确确认时启用，否则自动从头传输。
 
 返回 `{transfer_id,status:"queued"|"running"|"completed"}`。`transfer_id` 与数据库 `sftp_operations.id` 相同；长任务通过 `transfer.progress` 事件报告进度。
 
 ### `transfer_pause|transfer_resume|transfer_cancel`
 
-请求 `{transfer_id,reason?}`。取消和暂停不删除临时文件；完成状态为 `completed|failed|cancelled`。下载支持按大小和 SHA-256 续传；上传只有在服务端确认安全 append 且用户确认时续传。
+请求 `{transfer_id,reason?}`。取消和暂停不删除临时文件；完成状态为 `completed|failed|cancelled`。下载支持按大小和 SHA-256 续传；上传只有在服务端确认安全 append 且用户确认时续传，否则恢复时从头传输。
 
 ### `transfer_retry`
 
@@ -117,7 +117,7 @@ ID 使用 UUID/ULID；时间使用 UTC RFC3339；长任务返回任务 ID；所�
 
 ### `agent_message_send`
 
-请求 `{session_id,text,mode?,client_request_id}`，立即返回 `{task_id,status:"active",conversation_id}`；最终回答通过 `agent.delta` 事件返回。模式为 `readonly|ask_before_execute|allow_safe_commands|manual_only`，默认 `ask_before_execute`。模型需要工具时只返回一个 `{tool,arguments}` JSON 对象；桌面端仅接受本文定义的 8 个工具并重新生成 `request_id`、`policy_version` 和 `deadline`，不会信任模型携带的元数据或破坏性确认字段。最终执行仍由 Rust 策略、审批、路径校验和急停状态裁决。
+请求 `{session_id,text,mode?,conversation_id?,client_request_id}`，立即返回 `{task_id,status:"active",conversation_id}`；最终回答通过 `agent.delta` 事件返回，事件 `data` 包含 `task_id`、`conversation_id`、`status` 和 `delta`。模式为 `readonly|ask_before_execute|allow_safe_commands|manual_only`，默认 `ask_before_execute`。模型需要工具时只返回一个 `{tool,arguments}` JSON 对象；桌面端仅接受本文定义的 8 个工具并重新生成 `request_id`、`policy_version` 和 `deadline`，不会信任模型携带的元数据或破坏性确认字段。文件上传、下载、删除、重命名和新目录等 Agent 文件操作必须由用户在 SFTP 页面明确确认，不能由模型自动确认；最终执行仍由 Rust 策略、审批、路径校验和急停状态裁决。
 
 ### `agent_cancel`
 

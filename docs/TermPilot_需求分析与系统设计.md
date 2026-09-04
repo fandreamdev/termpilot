@@ -62,6 +62,9 @@ MVP 只承诺 POSIX/OpenSSH 远端的 Agent 命令执行；Windows 远端可连�
 
 不接受任意 Shell 字符串，不执行 `sh -c`、`bash -c`、`eval`、管道、重定向、二次 SSH、递归删除、权限修改或动态脚本。无法证明安全时直接阻断。生产环境修改操作必须人工审批。
 
+Agent 触发的上传、下载、删除、重命名和新目录请求不能伪造用户确认；缺少用户确认时
+Rust Core 返回 `APPROVAL_REQUIRED`，只有用户在 SFTP 页面明确确认后才能操作。
+
 终端和远程文件内容一律视为不可信数据，发送模型前按规则脱敏；公网模型禁止接收密码、私钥、Token、Cookie 和凭据文件。
 
 ## 8. 审计、急停和失败策略
@@ -69,6 +72,8 @@ MVP 只承诺 POSIX/OpenSSH 远端的 Agent 命令执行；Windows 远端可连�
 授权/审批事件必须在远程执行前写入 SQLite。审计哈希为 `SHA256(canonical_json(event_without_hash_fields) || prev_hash)`，第一条事件使用全零 genesis 值。审计不可用、策略版本变化、审批过期、指纹变化、路径越界或急停时，远程写操作必须拒绝。
 
 急停立即阻断新 Agent、SFTP 和命令，并尽力关闭活动 channel；解除需要当前 Windows 用户重新确认。应用重启后不自动恢复远程命令，SFTP 临时文件只能人工恢复。
+
+数据库恢复会关闭并使备份中的活动会话、传输、审批和 Agent 对话失效，恢复后必须重新建立会话。
 
 ## 9. 非功能要求
 

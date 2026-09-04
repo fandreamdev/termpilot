@@ -29,9 +29,9 @@ use transport::{SftpTransport, SshTransport};
 
 struct AppState {
     db: Arc<Mutex<rusqlite::Connection>>,
-    emergency_stop: AtomicBool,
-    emergency_agent_stop: AtomicBool,
-    stopped_sessions: Mutex<HashSet<String>>,
+    emergency_stop: Arc<AtomicBool>,
+    emergency_agent_stop: Arc<AtomicBool>,
+    stopped_sessions: Arc<Mutex<HashSet<String>>>,
     event_seq: Arc<Mutex<HashMap<(String, String), u64>>>,
     // `never` passwords live here only until the current process exits.
     // Session passwords use Windows Credential Manager; tracked targets are
@@ -39,6 +39,7 @@ struct AppState {
     credential_cache: Mutex<HashMap<String, String>>,
     session_credential_targets: Mutex<HashSet<String>>,
     agent_cancelled: Arc<Mutex<HashSet<String>>>,
+    agent_tasks: Arc<Mutex<HashMap<String, String>>>,
     _config: config::AppConfig,
     ssh: Arc<dyn SshTransport>,
     sftp: Arc<dyn SftpTransport>,
@@ -91,6 +92,27 @@ fn is_agent_cancelled(cancelled: &Mutex<HashSet<String>>, task_id: &str) -> bool
         .map(|items| items.contains(task_id))
         .unwrap_or(true)
 }
+fn cancel_agent_tasks_for_scope(state: &AppState, scope: &str, session_id: Option<&str>) {
+    let Ok(tasks) = state.agent_tasks.lock() else {
+        return;
+    };
+    let task_ids: Vec<String> = tasks
+        .iter()
+        .filter(|(_, task_session)| {
+            scope == "all"
+                || scope == "agent"
+                || (scope == "session" && session_id == Some(task_session.as_str()))
+        })
+        .map(|(task_id, _)| task_id.clone())
+        .collect();
+    drop(tasks);
+    let Ok(mut cancelled) = state.agent_cancelled.lock() else {
+        return;
+    };
+    for task_id in task_ids {
+        cancelled.insert(task_id);
+    }
+}
 fn next_event_seq(state: &AppState, session_id: &str, stream: &str) -> u64 {
     let Ok(mut sequences) = state.event_seq.lock() else {
         return 1;
@@ -100,7 +122,7 @@ fn next_event_seq(state: &AppState, session_id: &str, stream: &str) -> u64 {
     sequences.insert(key, next);
     next
 }
-static AUDIT_EVENT_SEQ: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+static AUDIT_EVENT_SEQ: OnceLock<Mutex<HashMap<(String, String), u64>>> = OnceLock::new();
 
 fn install_audit_listener(app: AppHandle) {
     db::set_audit_listener(Arc::new(move |record| {
@@ -109,8 +131,9 @@ fn install_audit_listener(app: AppHandle) {
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .map(|mut sequences| {
-                let next = sequences.get(&stream_key).copied().unwrap_or(0) + 1;
-                sequences.insert(stream_key.clone(), next);
+                let key = (stream_key.clone(), "audit".to_owned());
+                let next = sequences.get(&key).copied().unwrap_or(0) + 1;
+                sequences.insert(key, next);
                 next
             })
             .unwrap_or(1);
@@ -564,7 +587,8 @@ fn session_connect(
         .and_then(Value::as_bool)
         .unwrap_or(false)
         || supplied_fingerprint.as_deref() == Some(computed_fingerprint.as_str())
-        || supplied_fingerprint.as_deref() == stored_fingerprint.as_deref();
+        || supplied_fingerprint.as_deref() == stored_fingerprint.as_deref()
+        || stored_fingerprint.as_deref() == Some(computed_fingerprint.as_str());
     if stored_fingerprint.as_deref() != Some(computed_fingerprint.as_str())
         && stored_fingerprint.is_some()
         && supplied_fingerprint.as_deref() != Some(computed_fingerprint.as_str())
@@ -601,11 +625,40 @@ fn session_connect(
     {
         return err("SSH_TIMEOUT", "SSH 连接失败");
     }
+    let _ = conn.execute(
+        "UPDATE hosts SET endpoint_fingerprint=? WHERE id=?",
+        rusqlite::params![computed_fingerprint, host_id],
+    );
+    let now = Utc::now().to_rfc3339();
+    if conn.execute("INSERT INTO sessions(id,host_id,status,observed_endpoint_fingerprint,pty_rows,pty_cols,started_at) VALUES(?,?,?,?,?,?,?)",rusqlite::params![id,host_id,"ready",computed_fingerprint,rows,cols,now]).is_err(){
+        state.ssh.close(&id);
+        return err("INTERNAL","创建会话失败");
+    };
+    let session = Session {
+        id,
+        host_id,
+        status: "ready".into(),
+        started_at: now.clone(),
+    };
+    let seq = next_event_seq(&state, &session.id, "session");
+    let _ = app.emit("session.status", json!({"event":"session.status","version":1,"seq":seq,"session_id":session.id,"correlation_id":session.id,"occurred_at":now,"data":{"status":"ready"}}));
+    state.sftp.register_session(
+        &session.id,
+        &address,
+        port,
+        &username,
+        credential_material.as_ref(),
+    );
     let db_for_disconnect = state.db.clone();
+    let ssh_for_disconnect = state.ssh.clone();
+    let sftp_for_disconnect = state.sftp.clone();
+    let event_seq_for_output = state.event_seq.clone();
     state.ssh.start_output_pump(
-        &id,
+        &session.id,
         app.clone(),
         Arc::new(move |session_id| {
+            ssh_for_disconnect.close(session_id);
+            sftp_for_disconnect.unregister_session(session_id);
             if let Ok(conn) = db_for_disconnect.lock() {
                 if db::disconnect_session(&conn, session_id, Some("remote_eof")).unwrap_or(false) {
                     let _ = db::append_audit(
@@ -620,24 +673,8 @@ fn session_connect(
                 }
             }
         }),
+        Arc::new(move |session_id, stream| next_seq_for(&event_seq_for_output, session_id, stream)),
     );
-    state
-        .sftp
-        .register_session(&id, &address, port, &username, credential_material.as_ref());
-    let _ = conn.execute(
-        "UPDATE hosts SET endpoint_fingerprint=? WHERE id=?",
-        rusqlite::params![computed_fingerprint, host_id],
-    );
-    let now = Utc::now().to_rfc3339();
-    if conn.execute("INSERT INTO sessions(id,host_id,status,observed_endpoint_fingerprint,pty_rows,pty_cols,started_at) VALUES(?,?,?,?,?,?,?)",rusqlite::params![id,host_id,"ready",computed_fingerprint,rows,cols,now]).is_err(){return err("INTERNAL","创建会话失败")};
-    let session = Session {
-        id,
-        host_id,
-        status: "ready".into(),
-        started_at: now.clone(),
-    };
-    let seq = next_event_seq(&state, &session.id, "session");
-    let _ = app.emit("session.status", json!({"event":"session.status","version":1,"seq":seq,"session_id":session.id,"correlation_id":session.id,"occurred_at":now,"data":{"status":"ready"}}));
     Envelope::ok(session)
 }
 
@@ -1142,6 +1179,7 @@ fn sftp_transfer_start(
     ) {
         return err("VALIDATION", "不支持的 SFTP 操作");
     };
+    let agent_request = request.get("request_id").is_some();
     let mut src = val_str(&request, "src");
     let mut dst = val_str(&request, "dst");
     for key in ["src", "dst"] {
@@ -1208,27 +1246,33 @@ fn sftp_transfer_start(
         return err("SESSION_CLOSED", "会话不存在或已关闭");
     }
     let production = db::session_host_is_production(&conn, &session).unwrap_or(false);
-    let resume = request
+    let requested_resume = request
         .get("resume")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if op == "upload"
-        && resume
-        && (!state.sftp.supports_safe_append()
-            || !request
-                .get("resume_confirmed")
-                .and_then(Value::as_bool)
-                .unwrap_or(false))
-    {
-        return err(
-            "POLICY_BLOCKED",
-            "上传续传需要服务端安全 append 能力和用户明确确认",
-        );
-    }
+    let resume = requested_resume
+        && (op != "upload"
+            || (state.sftp.supports_safe_append()
+                && request
+                    .get("resume_confirmed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)));
     let confirmed = request
         .get("confirmed")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    if agent_request
+        && matches!(
+            op.as_str(),
+            "upload" | "download" | "delete" | "rename" | "mkdir"
+        )
+        && !confirmed
+    {
+        return err(
+            "APPROVAL_REQUIRED",
+            "Agent 文件操作必须由用户在 SFTP 页面明确确认",
+        );
+    }
     let overwrite = request
         .get("overwrite")
         .and_then(Value::as_bool)
@@ -1696,7 +1740,7 @@ fn transfer_resume(app: AppHandle, state: State<'_, AppState>, request: Value) -
     if let Some(x) = reject_if_session_stopped(&state, &session_id) {
         return x;
     }
-    let resume = if operation == "download" {
+    let resume_requested = if operation == "download" {
         true
     } else {
         request
@@ -1704,19 +1748,13 @@ fn transfer_resume(app: AppHandle, state: State<'_, AppState>, request: Value) -
             .and_then(Value::as_bool)
             .unwrap_or(false)
     };
-    if operation == "upload"
-        && resume
-        && (!state.sftp.supports_safe_append()
-            || !request
-                .get("resume_confirmed")
-                .and_then(Value::as_bool)
-                .unwrap_or(false))
-    {
-        return err(
-            "POLICY_BLOCKED",
-            "上传续传需要服务端安全 append 能力和用户明确确认",
-        );
-    }
+    let resume = resume_requested
+        && (operation != "upload"
+            || (state.sftp.supports_safe_append()
+                && request
+                    .get("resume_confirmed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)));
     if db::update_sftp_status(&conn, &id, "running").is_err() {
         return err("CONFLICT", "传输任务状态更新失败");
     }
@@ -2214,6 +2252,14 @@ fn execute_approved_command(state: State<'_, AppState>, request: Value) -> Envel
                 .collect()
         })
         .unwrap_or_default();
+    let structured = json!({
+        "program": args.first().cloned().unwrap_or_default(),
+        "args": args.iter().skip(1).cloned().collect::<Vec<_>>()
+    });
+    if !policy::validate_structured_command(&structured) || policy::command_risk(&args) == "blocked"
+    {
+        return err("POLICY_BLOCKED", "审批命令不符合当前结构化命令策略");
+    }
     let computed_hash = hex::encode(sha2::Sha256::digest(args.join("\0").as_bytes()));
     if current_policy_id != policy_id
         || current_version != policy_version
@@ -2362,10 +2408,14 @@ fn agent_message_send(
     let event_seq_for_task = state.event_seq.clone();
     let model_for_task = state.model.clone();
     let cancelled_for_task = state.agent_cancelled.clone();
+    let tasks_for_task = state.agent_tasks.clone();
     let task_id_for_task = task_id.clone();
     let session_for_task = session_id.clone();
     let conversation_for_task = conversation_id.clone();
     let mode_for_task = mode.clone();
+    if let Ok(mut active) = state.agent_tasks.lock() {
+        active.insert(task_id.clone(), session_id.clone());
+    }
     std::thread::spawn(move || {
         run_agent_task(
             app_for_task,
@@ -2373,6 +2423,7 @@ fn agent_message_send(
             event_seq_for_task,
             model_for_task,
             cancelled_for_task,
+            tasks_for_task,
             task_id_for_task,
             session_for_task,
             conversation_for_task,
@@ -2393,6 +2444,7 @@ fn run_agent_task(
     event_seq: Arc<Mutex<HashMap<(String, String), u64>>>,
     model: Arc<dyn ModelClient>,
     cancelled: Arc<Mutex<HashSet<String>>>,
+    tasks: Arc<Mutex<HashMap<String, String>>>,
     task_id: String,
     session_id: String,
     conversation_id: String,
@@ -2431,6 +2483,9 @@ fn run_agent_task(
         if let Ok(mut items) = cancelled.lock() {
             items.remove(&task_id);
         }
+        if let Ok(mut active) = tasks.lock() {
+            active.remove(&task_id);
+        }
         return;
     };
     let _ = conn.execute(
@@ -2467,10 +2522,13 @@ fn run_agent_task(
     let seq = next_seq_for(&event_seq, &session_id, "agent");
     let _ = app.emit(
         "agent.delta",
-        json!({"event":"agent.delta","version":1,"seq":seq,"session_id":session_id,"correlation_id":task_id,"occurred_at":Utc::now().to_rfc3339(),"data":{"task_id":task_id,"status":model_status,"delta":response}}),
+        json!({"event":"agent.delta","version":1,"seq":seq,"session_id":session_id,"correlation_id":task_id,"occurred_at":Utc::now().to_rfc3339(),"data":{"task_id":task_id,"conversation_id":conversation_id,"status":model_status,"delta":response}}),
     );
     if let Ok(mut items) = cancelled.lock() {
         items.remove(&task_id);
+    }
+    if let Ok(mut active) = tasks.lock() {
+        active.remove(&task_id);
     }
 }
 
@@ -2534,7 +2592,7 @@ fn approval_decide(state: State<'_, AppState>, request: Value) -> Envelope<Value
     if n == 0 {
         return err("APPROVAL_EXPIRED", "审批不存在、已处理或已过期");
     };
-    let _ = db::append_audit(
+    if db::append_audit(
         &conn,
         if decision == "approve" {
             "approval.approved"
@@ -2546,7 +2604,17 @@ fn approval_decide(state: State<'_, AppState>, request: Value) -> Envelope<Value
         None,
         Some(&approval_session),
         &json!({"approval_id":id,"status":status}),
-    );
+    )
+    .is_err()
+    {
+        // Never leave an approval executable when its authorization event
+        // could not be committed to the hash chain.
+        let _ = conn.execute(
+            "UPDATE command_approvals SET status='expired',decided_at=? WHERE id=?",
+            rusqlite::params![Utc::now().to_rfc3339(), id],
+        );
+        return err("AUDIT_UNAVAILABLE", "审计不可用，审批已失效");
+    }
     Envelope::ok(json!({"approval_id":id,"status":status}))
 }
 
@@ -2744,14 +2812,18 @@ fn database_backup(state: State<'_, AppState>, request: Value) -> Envelope<Value
             let hash = fs::read(&path)
                 .ok()
                 .map(|b| hex::encode(sha2::Sha256::digest(b)));
-            let _ = audit_event(
+            if audit_event(
                 &state,
                 "database.backup",
                 "info",
                 None,
                 None,
                 json!({"path":path,"file_hash":hash}),
-            );
+            )
+            .is_err()
+            {
+                return err("AUDIT_UNAVAILABLE", "备份已生成，但审计写入失败");
+            }
             Envelope::ok(json!({"path":path,"file_hash":hash}))
         }
         Err(_) => err("INTERNAL", "数据库备份失败"),
@@ -2780,6 +2852,7 @@ fn database_restore(state: State<'_, AppState>, request: Value) -> Envelope<Valu
     // A restore invalidates every session and transfer reference in the live
     // database; close channels before swapping rows so no remote operation can
     // continue against stale authorization context.
+    cancel_agent_tasks_for_scope(&state, "all", None);
     state.ssh.close_all();
     state.sftp.close_all();
     let conn = state.db.lock().unwrap();
@@ -2821,6 +2894,18 @@ fn database_restore(state: State<'_, AppState>, request: Value) -> Envelope<Valu
         }
     }
     if ok {
+        let restored_at = Utc::now().to_rfc3339();
+        ok = conn
+            .execute_batch(&format!(
+                "UPDATE sessions SET status='closed',ended_at=COALESCE(ended_at,'{restored_at}'),disconnect_reason='database_restore' WHERE status IN('connecting','ready','reconnecting');\
+                 UPDATE sftp_operations SET status='cancelled',ended_at=COALESCE(ended_at,'{restored_at}'),error_code='DATABASE_RESTORE' WHERE status IN('queued','running','paused');\
+                 UPDATE command_approvals SET status='expired',decided_at=COALESCE(decided_at,'{restored_at}') WHERE status IN('pending','approved');\
+                 UPDATE execution_records SET status='cancelled',ended_at=COALESCE(ended_at,'{restored_at}') WHERE status='running';\
+                 UPDATE agent_conversations SET status='cancelled',updated_at='{restored_at}' WHERE status='active';"
+            ))
+            .is_ok();
+    }
+    if ok {
         if conn.execute_batch("COMMIT;").is_err() {
             ok = false;
         }
@@ -2831,7 +2916,13 @@ fn database_restore(state: State<'_, AppState>, request: Value) -> Envelope<Valu
     if !ok {
         return err("INTERNAL", "数据库恢复失败");
     }
-    let _ = db::append_audit(
+    if let Ok(mut sequences) = state.event_seq.lock() {
+        sequences.clear();
+    }
+    if let Ok(mut stopped) = state.stopped_sessions.lock() {
+        stopped.clear();
+    }
+    if db::append_audit(
         &conn,
         "database.restore",
         "critical",
@@ -2839,7 +2930,11 @@ fn database_restore(state: State<'_, AppState>, request: Value) -> Envelope<Valu
         None,
         None,
         &json!({"restored":true}),
-    );
+    )
+    .is_err()
+    {
+        return err("AUDIT_UNAVAILABLE", "数据库已恢复，但审计写入失败");
+    }
     Envelope::ok(json!({"restored":true}))
 }
 
@@ -2859,11 +2954,14 @@ fn emergency_stop(app: AppHandle, state: State<'_, AppState>, request: Value) ->
     }
     if scope == "all" {
         state.emergency_stop.store(true, Ordering::SeqCst);
+        state.emergency_agent_stop.store(true, Ordering::SeqCst);
+        cancel_agent_tasks_for_scope(&state, "all", None);
         state.ssh.close_all();
         state.sftp.close_all();
         let _ = db::close_all_sessions(&state.db.lock().unwrap(), "emergency_stop");
     } else if scope == "agent" {
         state.emergency_agent_stop.store(true, Ordering::SeqCst);
+        cancel_agent_tasks_for_scope(&state, "agent", None);
     } else if scope == "session" {
         if let Some(session_id) = requested_session.as_deref() {
             if !db::session_exists(&state.db.lock().unwrap(), session_id).unwrap_or(false) {
@@ -2874,6 +2972,7 @@ fn emergency_stop(app: AppHandle, state: State<'_, AppState>, request: Value) ->
             if let Ok(mut stopped) = state.stopped_sessions.lock() {
                 stopped.insert(session_id.to_owned());
             }
+            cancel_agent_tasks_for_scope(&state, "session", Some(session_id));
             let _ = db::disconnect_session(
                 &state.db.lock().unwrap(),
                 session_id,
@@ -2948,13 +3047,14 @@ fn main() {
         })
         .manage(AppState {
             db: Arc::new(Mutex::new(conn)),
-            emergency_stop: AtomicBool::new(false),
-            emergency_agent_stop: AtomicBool::new(false),
-            stopped_sessions: Mutex::new(HashSet::new()),
+            emergency_stop: Arc::new(AtomicBool::new(false)),
+            emergency_agent_stop: Arc::new(AtomicBool::new(false)),
+            stopped_sessions: Arc::new(Mutex::new(HashSet::new())),
             event_seq: Arc::new(Mutex::new(HashMap::new())),
             credential_cache: Mutex::new(HashMap::new()),
             session_credential_targets: Mutex::new(HashSet::new()),
             agent_cancelled: Arc::new(Mutex::new(HashSet::new())),
+            agent_tasks: Arc::new(Mutex::new(HashMap::new())),
             _config: app_config,
             ssh,
             sftp,
@@ -3015,4 +3115,39 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("error while running TermPilot");
+}
+
+#[cfg(test)]
+mod app_tests {
+    use super::*;
+
+    #[test]
+    fn emergency_scope_marks_matching_agent_tasks_cancelled() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../migrations/001_init.sql"))
+            .unwrap();
+        let state = AppState {
+            db: Arc::new(Mutex::new(conn)),
+            emergency_stop: Arc::new(AtomicBool::new(false)),
+            emergency_agent_stop: Arc::new(AtomicBool::new(false)),
+            stopped_sessions: Arc::new(Mutex::new(HashSet::new())),
+            event_seq: Arc::new(Mutex::new(HashMap::new())),
+            credential_cache: Mutex::new(HashMap::new()),
+            session_credential_targets: Mutex::new(HashSet::new()),
+            agent_cancelled: Arc::new(Mutex::new(HashSet::new())),
+            agent_tasks: Arc::new(Mutex::new(HashMap::from([
+                ("task-a".to_owned(), "session-a".to_owned()),
+                ("task-b".to_owned(), "session-b".to_owned()),
+            ]))),
+            _config: config::AppConfig::default(),
+            ssh: Arc::new(transport::MockSshTransport),
+            sftp: Arc::new(transport::MockSftpTransport::default()),
+            model: Arc::new(model_client::MockModelClient),
+        };
+
+        cancel_agent_tasks_for_scope(&state, "session", Some("session-a"));
+        let cancelled = state.agent_cancelled.lock().unwrap();
+        assert!(cancelled.contains("task-a"));
+        assert!(!cancelled.contains("task-b"));
+    }
 }

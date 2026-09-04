@@ -8,10 +8,7 @@ use std::{
     io::{Read, Write},
     path::PathBuf,
     process::{Child, Command, Stdio},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
 };
 use tauri::{AppHandle, Emitter};
 use thiserror::Error;
@@ -25,6 +22,7 @@ pub enum TransportError {
     #[error("transport unavailable: {0}")]
     Unavailable(String),
 }
+pub type EventSeqFn = Arc<dyn Fn(&str, &str) -> u64 + Send + Sync>;
 #[derive(Clone, Debug)]
 pub enum CredentialMaterial {
     Password(String),
@@ -51,6 +49,7 @@ pub trait SshTransport: Send + Sync {
         _session_id: &str,
         _app: AppHandle,
         _on_disconnect: Arc<dyn Fn(&str) + Send + Sync>,
+        _next_seq: EventSeqFn,
     ) {
     }
     fn send_input(&self, session_id: &str, bytes: &[u8]) -> Result<usize, TransportError>;
@@ -377,18 +376,58 @@ impl SshTransport for OpenSshTransport {
                     "powershell.exe -NoProfile -NonInteractive -Command [Console]::Write($env:TERMPILOT_PASSWORD)",
                 );
         }
-        let child = command_process
+        let mut child = command_process
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::null())
             .spawn()
             .map_err(|e| TransportError::Unavailable(format!("ssh: {e}")))?;
         let pid = child.id();
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| TransportError::Unavailable("ssh stdout unavailable".into()))?;
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = sender.send(child.wait_with_output());
+            let mut output = Vec::with_capacity(max_output.min(64 * 1024));
+            let mut buffer = [0u8; 16 * 1024];
+            let mut overflow = false;
+            loop {
+                match stdout.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let remaining = max_output.saturating_sub(output.len());
+                        if n > remaining {
+                            output.extend_from_slice(&buffer[..remaining]);
+                            overflow = true;
+                            break;
+                        }
+                        output.extend_from_slice(&buffer[..n]);
+                    }
+                    Err(_) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = sender.send(Err(TransportError::Unavailable(
+                            "ssh stdout read failed".into(),
+                        )));
+                        return;
+                    }
+                }
+            }
+            if overflow {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = sender.send(Err(TransportError::Unavailable(
+                    "command output limit exceeded".into(),
+                )));
+                return;
+            }
+            let status = child
+                .wait()
+                .map_err(|e| TransportError::Unavailable(e.to_string()));
+            let _ = sender.send(status.map(|status| (output, status.code().unwrap_or(1))));
         });
         let output = match receiver.recv_timeout(timeout) {
-            Ok(result) => result.map_err(|e| TransportError::Unavailable(e.to_string()))?,
+            Ok(result) => result?,
             Err(_) => {
                 #[cfg(windows)]
                 {
@@ -401,15 +440,14 @@ impl SshTransport for OpenSshTransport {
                 return Err(TransportError::Timeout);
             }
         };
-        let mut stdout = output.stdout;
-        stdout.truncate(max_output);
-        Ok((stdout, output.status.code().unwrap_or(1)))
+        Ok(output)
     }
     fn start_output_pump(
         &self,
         session_id: &str,
         app: AppHandle,
         on_disconnect: Arc<dyn Fn(&str) + Send + Sync>,
+        next_seq: EventSeqFn,
     ) {
         let Ok(mut children) = self.children.lock() else {
             return;
@@ -422,19 +460,18 @@ impl SshTransport for OpenSshTransport {
         };
         let id = session_id.to_owned();
         let on_disconnect_for_task = on_disconnect.clone();
-        let sequence = AtomicU64::new(1);
         std::thread::spawn(move || {
             let mut buffer = [0u8; 8192];
             loop {
                 match stdout.read(&mut buffer) {
                     Ok(0) | Err(_) => {
-                        let seq = sequence.fetch_add(1, Ordering::SeqCst) + 1;
+                        let seq = next_seq(&id, "session");
                         let _ = app.emit("session.status", serde_json::json!({"event":"session.status","version":1,"seq":seq,"session_id":id,"correlation_id":id,"occurred_at":chrono::Utc::now().to_rfc3339(),"data":{"status":"disconnected"}}));
                         on_disconnect_for_task(&id);
                         break;
                     }
                     Ok(n) => {
-                        let seq = sequence.fetch_add(1, Ordering::SeqCst) + 1;
+                        let seq = next_seq(&id, "session");
                         let _ = app.emit("session.output", serde_json::json!({"event":"session.output","version":1,"seq":seq,"session_id":id,"correlation_id":id,"occurred_at":chrono::Utc::now().to_rfc3339(),"data":{"bytes_base64":base64::engine::general_purpose::STANDARD.encode(&buffer[..n])}}));
                     }
                 }
@@ -547,7 +584,7 @@ impl OpenSftpTransport {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::null())
             .spawn()
             .map_err(|e| TransportError::Unavailable(format!("sftp: {e}")))?;
         if let Some(mut stdin) = child.stdin.take() {
@@ -556,18 +593,30 @@ impl OpenSftpTransport {
                 .map_err(|e| TransportError::Unavailable(e.to_string()))?;
             stdin.write_all(b"\nquit\n").ok();
         }
-        let output = child
-            .wait_with_output()
+        const MAX_BATCH_OUTPUT: usize = 8 * 1024 * 1024;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| TransportError::Unavailable("sftp stdout unavailable".into()))?;
+        let mut bytes = Vec::with_capacity(64 * 1024);
+        stdout
+            .take((MAX_BATCH_OUTPUT + 1) as u64)
+            .read_to_end(&mut bytes)
             .map_err(|e| TransportError::Unavailable(e.to_string()))?;
-        if !output.status.success() {
+        if bytes.len() > MAX_BATCH_OUTPUT {
+            let _ = child.kill();
+            let _ = child.wait();
             return Err(TransportError::Unavailable(
-                String::from_utf8_lossy(&output.stderr)
-                    .chars()
-                    .take(256)
-                    .collect(),
+                "sftp output limit exceeded".into(),
             ));
         }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        let status = child
+            .wait()
+            .map_err(|e| TransportError::Unavailable(e.to_string()))?;
+        if !status.success() {
+            return Err(TransportError::Unavailable("sftp operation failed".into()));
+        }
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
     fn remote_exists(&self, session_id: &str, path: &str) -> bool {
         self.batch(session_id, &[format!("ls {}", sftp_quote(path))])
@@ -828,6 +877,24 @@ mod tests {
         assert_eq!(first, second);
         assert!(first.starts_with("SHA256:"));
     }
+
+    #[test]
+    fn mock_upload_resume_replaces_verified_prefix() {
+        let transport = MockSftpTransport::default();
+        transport
+            .write_file("session", "~/resume.txt", b"prefix", true)
+            .unwrap();
+        let path =
+            std::env::temp_dir().join(format!("termpilot-upload-{}.txt", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"prefix-and-more").unwrap();
+        let result = transport.upload_from_path("session", &path, "~/resume.txt", false, true);
+        assert!(result.is_ok());
+        assert_eq!(
+            transport.read_file("session", "~/resume.txt", 64).unwrap(),
+            b"prefix-and-more"
+        );
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[derive(Default)]
@@ -950,7 +1017,7 @@ impl SftpTransport for MockSftpTransport {
                 return Err(TransportError::Unavailable("resume prefix mismatch".into()));
             }
         }
-        self.write_file(session_id, remote, &bytes, overwrite)?;
+        self.write_file(session_id, remote, &bytes, overwrite || resume)?;
         Ok((metadata.len(), hash))
     }
     fn download_to_path(

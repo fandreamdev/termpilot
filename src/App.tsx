@@ -241,7 +241,12 @@ export default function App() {
         ) : page === "主机" ? (
           <HostsPage hosts={hosts} setHosts={setHosts} connect={connect} />
         ) : page === "SFTP" ? (
-          <SftpPage session={session} />
+          <SftpPage
+            session={session}
+            production={Boolean(
+              session && hosts.find((host) => host.id === session.host_id)?.is_production,
+            )}
+          />
         ) : page === "审计" ? (
           <AuditPage />
         ) : page === "设置" ? (
@@ -636,7 +641,13 @@ function HostsPage({
 }
 
 type Transfer = { id: string; name: string; status: string; progress: number };
-function SftpPage({ session }: { session?: Session }) {
+function SftpPage({
+  session,
+  production,
+}: {
+  session?: Session;
+  production: boolean;
+}) {
   const [path, setPath] = useState("~");
   const [remoteFiles, setRemoteFiles] = useState<
     Array<{ name: string; kind: string }>
@@ -734,6 +745,11 @@ function SftpPage({ session }: { session?: Session }) {
       );
   };
   const uploadPath = (local: string, filename: string) => {
+    if (
+      production &&
+      !window.confirm(`生产主机将上传 ${filename}，确认继续？`)
+    )
+      return;
     void start(
       {
         op: "upload",
@@ -880,7 +896,14 @@ function SftpPage({ session }: { session?: Session }) {
                     className="btn"
                     onClick={() => {
                       const next = window.prompt("重命名为", file.name);
-                      if (next && next !== file.name)
+                      if (
+                        next &&
+                        next !== file.name &&
+                        (!production ||
+                          window.confirm(
+                            `生产主机将把 ${file.name} 重命名为 ${next}，确认继续？`,
+                          ))
+                      )
                         void start(
                           {
                             op: "rename",
@@ -897,7 +920,9 @@ function SftpPage({ session }: { session?: Session }) {
                   <button
                     className="btn red"
                     onClick={() =>
-                      window.confirm(`删除 ${file.name}？`) &&
+                      window.confirm(
+                        `${production ? "生产主机：" : ""}删除 ${file.name}？`,
+                      ) &&
                       void start(
                         {
                           op: "delete",
@@ -1082,15 +1107,26 @@ function SettingsPage({
     });
   }, []);
   const backup = async () => {
-    const path = window.prompt("输入备份 .db 的绝对路径");
-    if (path)
+    const selected =
+      "__TAURI_INTERNALS__" in window
+        ? await saveFileDialog({ defaultPath: "termpilot-backup.db" })
+        : window.prompt("输入备份 .db 的绝对路径");
+    if (typeof selected === "string" && selected)
       window.alert(
-        (await api.databaseBackup(path)).ok ? "备份完成" : "备份失败",
+        (await api.databaseBackup(selected)).ok ? "备份完成" : "备份失败",
       );
   };
   const restore = async () => {
-    const path = window.prompt("输入要恢复的 .db 绝对路径");
-    if (path && window.confirm("恢复会覆盖本地业务数据，确定继续？"))
+    const selected =
+      "__TAURI_INTERNALS__" in window
+        ? await openFileDialog({ multiple: false, directory: false })
+        : window.prompt("输入要恢复的 .db 绝对路径");
+    const path = Array.isArray(selected) ? selected[0] : selected;
+    if (
+      typeof path === "string" &&
+      path &&
+      window.confirm("恢复会覆盖本地业务数据，确定继续？")
+    )
       window.alert(
         (await api.databaseRestore(path, true)).ok
           ? "恢复完成，请重启应用"
@@ -1299,6 +1335,7 @@ function Terminal({
     Array<{ id: string; risk: string }>
   >([]);
   const [activeTaskId, setActiveTaskId] = useState<string>();
+  const [conversationId, setConversationId] = useState<string>();
   const agentBodyRef = useRef<HTMLDivElement>(null);
   const shellRef = useRef<HTMLDivElement>(null);
   const currentHost = hosts.find((h) => h.id === session?.host_id) ?? hosts[0];
@@ -1316,9 +1353,19 @@ function Terminal({
     );
   }, [session]);
   useEffect(() => {
+    setConversationId(undefined);
+    setActiveTaskId(undefined);
+    setApprovals([]);
+    setMessages([
+      "连接后终端输出不会写入数据库。",
+      "我会先执行安全的只读诊断。",
+    ]);
+  }, [session?.id]);
+  useEffect(() => {
     const listener = api.on<{ data?: { approval_id?: string; risk?: string } }>(
       "approval.created",
       (payload) => {
+        if (payload.session_id && payload.session_id !== session?.id) return;
         if (payload.data?.approval_id)
           setApprovals((items) => [
             ...items,
@@ -1331,11 +1378,18 @@ function Terminal({
     );
     const agentListener = api.on<{
       session_id?: string;
-      data?: { task_id?: string; status?: string; delta?: string };
+      data?: {
+        task_id?: string;
+        conversation_id?: string;
+        status?: string;
+        delta?: string;
+      };
     }>("agent.delta", async (payload) => {
       if (payload.session_id && payload.session_id !== session?.id) return;
       const delta = payload.data?.delta;
       if (!delta) return;
+      if (payload.data?.conversation_id)
+        setConversationId(payload.data.conversation_id);
       setActiveTaskId(undefined);
       setMessages((items) => [...items, delta]);
       const toolCall = parseAgentToolCall(delta);
@@ -1399,6 +1453,7 @@ function Terminal({
       session_id: session?.id ?? "mock-session",
       text: value,
       mode,
+      conversation_id: conversationId,
       client_request_id: crypto.randomUUID(),
     });
     const data = response.data as {
@@ -1414,6 +1469,8 @@ function Terminal({
       return;
     }
     const taskId = data?.task_id;
+    if (typeof (data as { conversation_id?: unknown } | null)?.conversation_id === "string")
+      setConversationId((data as { conversation_id: string }).conversation_id);
     if (data?.status === "active" && taskId) {
       setActiveTaskId(taskId);
       setMessages((items) => [...items, "Agent 正在处理…"]);
