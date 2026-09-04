@@ -4,7 +4,7 @@
 import * as React from "react";
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { api } from "./lib/tauri";
+import { api, parseAgentToolCall } from "./lib/tauri";
 import type { Host, Session } from "./types";
 import { Terminal as XTerminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -1350,10 +1350,21 @@ function Terminal({
       client_request_id: crypto.randomUUID(),
     });
     const data = response.data as { response?: string } | null;
-    setMessages((items) => [
-      ...items,
-      data?.response ?? response.error?.message ?? "Agent 暂时不可用",
-    ]);
+    const responseText =
+      data?.response ?? response.error?.message ?? "Agent 暂时不可用";
+    setMessages((items) => [...items, responseText]);
+    const toolCall = parseAgentToolCall(data?.response ?? "");
+    if (!toolCall) return;
+    if (!session) {
+      setMessages((items) => [...items, "工具调用需要先连接远程会话。"]);
+      return;
+    }
+    setMessages((items) => [...items, `正在调用工具：${toolCall.tool}`]);
+    const toolResult = await api.agentToolDispatch(toolCall, session.id);
+    const resultText = toolResult.ok
+      ? (JSON.stringify(toolResult.data) ?? "工具已完成")
+      : (toolResult.error?.message ?? "工具调用失败");
+    setMessages((items) => [...items, `${toolCall.tool}：${resultText}`]);
   };
   const decide = async (id: string, decision: "approve" | "reject") => {
     const response = await api.approvalDecide(id, decision);
